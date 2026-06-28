@@ -1,0 +1,9 @@
+node_modules
+dist-electron
+out
+release
+.vite
+*.log
+.env
+.env.*
+!.env.example
