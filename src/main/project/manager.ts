@@ -1,6 +1,7 @@
 import { dialog, BrowserWindow } from 'electron'
 import * as path from 'path'
 import { readDirectory, FileNode } from '../filesystem'
+import { getDialogParent } from '../dialogParent'
 
 export interface Project {
   path: string
@@ -11,7 +12,8 @@ export class ProjectManager {
   private currentProject: Project | null = null
 
   async openProjectDialog(parentWindow: BrowserWindow): Promise<Project | null> {
-    const result = await dialog.showOpenDialog(parentWindow, {
+    const dialogParent = getDialogParent(parentWindow)
+    const result = await dialog.showOpenDialog(dialogParent, {
       properties: ['openDirectory'],
       title: 'Open Project Folder'
     })

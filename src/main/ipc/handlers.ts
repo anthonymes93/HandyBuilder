@@ -1,6 +1,7 @@
 import { ipcMain, shell, dialog, BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import { join, relative, sep } from 'path'
 import * as fs from 'fs'
+import { getDialogParent } from '../dialogParent'
 import { ProjectManager } from '../project/manager'
 import { DevServerManager } from '../devserver/manager'
 import {
@@ -154,7 +155,8 @@ export function setupIpcHandlers(
 
     const projectPath = project.path
 
-    const result = await dialog.showOpenDialog(mainWindow, {
+    const dialogParent = getDialogParent(mainWindow)
+    const result = await dialog.showOpenDialog(dialogParent, {
       title: 'Choose Image',
       defaultPath: projectPath,
       properties: ['openFile'],
