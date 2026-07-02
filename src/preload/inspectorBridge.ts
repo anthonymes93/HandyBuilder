@@ -43,7 +43,7 @@ function clearSelected(): void {
   if (state.selected) { setOutline(state.selected, ''); state.selected = null }
 }
 
-function collectData(el: HTMLElement) {
+function collectData(el: HTMLElement, resolvedFrom?: string | null) {
   const rect = el.getBoundingClientRect()
   const cs   = window.getComputedStyle(el)
   const a    = el as HTMLAnchorElement
@@ -76,6 +76,7 @@ function collectData(el: HTMLElement) {
       transform: cs.transform,
     },
     href:      'href'      in el ? (a.getAttribute('href') ?? null) : null,
+    linkTarget: el.tagName === 'A' ? (a.getAttribute('target') ?? null) : null,
     inputType: 'type'      in el ? (inp.type || null) : null,
     disabled:  'disabled'  in el ? btn.disabled : undefined,
     value:     'value'     in el && el.tagName === 'INPUT' ? inp.value || null : null,
@@ -91,6 +92,8 @@ function collectData(el: HTMLElement) {
     hbComponentName: componentName ?? null,
     // Per-item identifier for mapped array elements (set via data-hb-item-id attribute)
     hbItemId: el.getAttribute('data-hb-item-id') ?? null,
+    // Set when the clicked element was resolved up to a closer ancestor (e.g. div → a)
+    resolvedFrom: resolvedFrom ?? null,
   }
 }
 
@@ -163,6 +166,53 @@ const DBLCLICK_MS = 350  // threshold in ms
 let lastClickMs = 0
 let lastClickEl: EventTarget | null = null
 
+// ─── selection priority resolver ─────────────────────────────────────────────
+// Text / content tags inside a link are independently selectable so the user
+// can still double-click to edit them inline.  Everything else (icon divs,
+// SVGs, spacers) defers to the wrapping anchor.
+const CONTENT_TAGS_IN_LINKS = new Set([
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'blockquote', 'li', 'dt', 'dd',
+])
+
+interface Resolved { el: HTMLElement; reason: string; resolvedFrom: string | null }
+
+function resolveSelectTarget(target: HTMLElement): Resolved {
+  // Walk from target toward the nearest <a>, looking for image-like content first.
+  // We stop climbing as soon as we hit an element that should be the selection.
+  let node: HTMLElement | null = target
+  while (node) {
+    const tag = node.tagName
+    // Explicit image elements always win.
+    if (tag === 'IMG' || tag === 'PICTURE') {
+      return { el: node, reason: 'image-direct', resolvedFrom: null }
+    }
+    // An element with a real CSS background-image wins over any ancestor link.
+    const bg = window.getComputedStyle(node).backgroundImage
+    if (bg && bg !== 'none' && bg !== '') {
+      return { el: node, reason: 'background-image', resolvedFrom: null }
+    }
+    // Reached an anchor boundary — stop the image scan here.
+    if (tag === 'A') break
+    node = node.parentElement
+  }
+
+  // No image found between target and <a>. Now decide link vs. content element.
+  const anchor = node && node.tagName === 'A' ? node as HTMLElement : null
+
+  if (anchor) {
+    if (target === anchor) return { el: anchor, reason: 'link-direct', resolvedFrom: null }
+    const targetTag = target.tagName.toLowerCase()
+    // Headings / paragraphs stay independently selectable for inline text editing.
+    if (CONTENT_TAGS_IN_LINKS.has(targetTag)) {
+      return { el: target, reason: 'container', resolvedFrom: null }
+    }
+    // Everything else (Visit Site div, icon SVG, spacer…) → anchor.
+    return { el: anchor, reason: 'link-closest', resolvedFrom: targetTag }
+  }
+
+  return { el: target, reason: 'container', resolvedFrom: null }
+}
+
 // ─── click / hover handlers ───────────────────────────────────────────────────
 
 function onClick(e: MouseEvent): void {
@@ -192,12 +242,14 @@ function onClick(e: MouseEvent): void {
   lastClickMs = now
   lastClickEl = target
 
-  log(`click on <${target.tagName.toLowerCase()}>`)
+  const { el: resolved, reason, resolvedFrom } = resolveSelectTarget(target)
+
+  log(`click on <${target.tagName.toLowerCase()}> → <${resolved.tagName.toLowerCase()}> [${reason}]`)
   clearSelected()
-  state.selected = target
-  setOutline(target, SELECT_OUTLINE)
-  if (state.hovered === target) state.hovered = null
-  ipcRenderer.sendToHost('inspector:selected', collectData(target))
+  state.selected = resolved
+  setOutline(resolved, SELECT_OUTLINE)
+  if (state.hovered === resolved) state.hovered = null
+  ipcRenderer.sendToHost('inspector:selected', collectData(resolved, resolvedFrom))
 }
 
 function onMouseOver(e: MouseEvent): void {
@@ -396,6 +448,18 @@ function commitEdit(): void {
     const { sourceFile, sourceLine, sourceCol } = editState.sourceInfo
     log(`[bridge] text-saved payload source info: file=${sourceFile ?? 'NONE'} line=${sourceLine ?? 'NONE'}`)
 
+    // Walk up the DOM to find the nearest data-hb-item-id (for mapped array cards).
+    let hbItemId: string | null = null
+    {
+      let node: HTMLElement | null = el
+      while (node) {
+        const id = node.getAttribute('data-hb-item-id')
+        if (id) { hbItemId = id; break }
+        node = node.parentElement
+      }
+    }
+    if (hbItemId) log(`[bridge] text-saved hbItemId="${hbItemId}"`)
+
     ipcRenderer.sendToHost('editor:text-saved', {
       tagName:      el.tagName.toLowerCase(),
       editedTagName: editState.editedTagName,
@@ -414,6 +478,7 @@ function commitEdit(): void {
       sourceFile,
       sourceLine,
       sourceCol,
+      hbItemId,
     })
     unwrapTemporaryTextEditor(el)
   } else {
@@ -513,6 +578,7 @@ function disable(): void {
 interface DomPatch {
   text?: string
   href?: string
+  linkTarget?: string
   disabled?: boolean
   imageSrc?: string
   imageAlt?: string
@@ -532,6 +598,10 @@ function applyDomPatch(patch: DomPatch): void {
 
   if (patch.text     !== undefined) el.textContent = patch.text
   if (patch.href     !== undefined) (el as HTMLAnchorElement).setAttribute('href', patch.href)
+  if (patch.linkTarget !== undefined) {
+    if (patch.linkTarget) el.setAttribute('target', patch.linkTarget)
+    else el.removeAttribute('target')
+  }
   if (patch.disabled !== undefined) (el as HTMLButtonElement).disabled = patch.disabled
 
   const img = el as HTMLImageElement

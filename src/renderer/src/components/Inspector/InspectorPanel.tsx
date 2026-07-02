@@ -562,38 +562,46 @@ interface EditableSectionProps {
 
 function LinkButtonSection({ element, saveStatus, onSave }: EditableSectionProps) {
   const kind      = classifyElement(element)
-  const showHref  = element.tagName === 'a'
+  const showHref  = element.tagName === 'a' || Boolean(element.href)
+  // Card-level <a> wrappers (hbItemId set) contain the full card as textContent —
+  // that multi-field aggregate is not meaningful to edit as a single text field.
+  const showText  = !showHref || !element.hbItemId
   const showValue = element.tagName === 'input' && Boolean(element.inputType)
 
   const originalText     = element.textContent ?? ''
   const originalHref     = element.href ?? ''
   const originalDisabled = element.disabled ?? false
   const originalValue    = element.value ?? ''
+  const originalNewTab   = element.linkTarget === '_blank'
 
   const [draftText,     setDraftText]     = useState(originalText)
   const [draftHref,     setDraftHref]     = useState(originalHref)
   const [draftDisabled, setDraftDisabled] = useState(originalDisabled)
   const [draftValue,    setDraftValue]    = useState(originalValue)
+  const [draftNewTab,   setDraftNewTab]   = useState(originalNewTab)
 
   useEffect(() => {
     setDraftText(element.textContent ?? '')
     setDraftHref(element.href ?? '')
     setDraftDisabled(element.disabled ?? false)
     setDraftValue(element.value ?? '')
+    setDraftNewTab(element.linkTarget === '_blank')
   }, [element])
 
-  const textChanged     = draftText.trim()  !== originalText.trim()
+  const textChanged     = showText && draftText.trim()  !== originalText.trim()
   const hrefChanged     = draftHref.trim()  !== originalHref.trim()
   const disabledChanged = draftDisabled     !== originalDisabled
   const valueChanged    = draftValue.trim() !== originalValue.trim()
-  const hasChanges      = textChanged || hrefChanged || disabledChanged || valueChanged
+  const newTabChanged   = draftNewTab       !== originalNewTab
+  const hasChanges      = textChanged || hrefChanged || disabledChanged || valueChanged || newTabChanged
 
   function handleSave() {
     const patch: InspectorSavePatch = { element }
-    if (textChanged)     patch.text     = draftText.trim()
-    if (hrefChanged)     patch.href     = draftHref.trim()
-    if (disabledChanged) patch.disabled = draftDisabled
-    if (valueChanged)    patch.text     = draftValue.trim()
+    if (textChanged)     patch.text       = draftText.trim()
+    if (hrefChanged)     patch.href       = draftHref.trim()
+    if (disabledChanged) patch.disabled   = draftDisabled
+    if (valueChanged)    patch.text       = draftValue.trim()
+    if (newTabChanged)   patch.linkTarget = draftNewTab ? '_blank' : ''
     onSave(patch)
   }
 
@@ -602,6 +610,7 @@ function LinkButtonSection({ element, saveStatus, onSave }: EditableSectionProps
     setDraftHref(originalHref)
     setDraftDisabled(originalDisabled)
     setDraftValue(originalValue)
+    setDraftNewTab(originalNewTab)
   }
 
   return (
@@ -611,14 +620,27 @@ function LinkButtonSection({ element, saveStatus, onSave }: EditableSectionProps
         <p className="text-[10px] text-gray-700 uppercase tracking-widest font-medium">Editable</p>
       </div>
 
-      {!showValue ? (
+      {showText && !showValue && (
         <EditField label="Text" value={draftText} placeholder="Element text…" onChange={setDraftText} />
-      ) : (
+      )}
+      {showValue && (
         <EditField label="Value" value={draftValue} placeholder="Button value…" onChange={setDraftValue} />
       )}
 
       {showHref && (
         <EditField label="Href" value={draftHref} placeholder="https://…" onChange={setDraftHref} />
+      )}
+
+      {showHref && (
+        <label className="flex items-center gap-2 mb-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={draftNewTab}
+            onChange={(e) => setDraftNewTab(e.target.checked)}
+            className="accent-blue-500"
+          />
+          <span className="text-[11px] text-gray-400">Open in new tab</span>
+        </label>
       )}
 
       {(element.tagName === 'button' || element.tagName === 'input') && (
@@ -832,6 +854,13 @@ export function InspectorPanel({
                 {selectedElement.classList.map((c) => (
                   <span key={c} className="font-mono text-[10px] text-gray-400 bg-gray-800 px-1.5 py-0.5 rounded">.{c}</span>
                 ))}
+              </div>
+            )}
+            {selectedElement.resolvedFrom && (
+              <div className="mt-1.5 text-[10px] text-gray-500">
+                Resolved from: <span className="font-mono text-gray-400">{selectedElement.resolvedFrom}</span>
+                <span className="text-gray-600"> → </span>
+                <span className="font-mono text-blue-400">{selectedElement.tagName}</span>
               </div>
             )}
           </Section>

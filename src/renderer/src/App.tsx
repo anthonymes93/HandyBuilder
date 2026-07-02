@@ -27,9 +27,12 @@ function App() {
     saveStatus,
     saveResult,
     pendingAnalysis,
+    pendingAstBindings,
     handleTextSaved,
     handleConfirmMatch,
     handleCancelConfirmation,
+    handleConfirmAstBinding,
+    handleCancelAstPicker,
     handleManualCommit,
     retryLastSave,
     dismissSaveResult,
@@ -171,6 +174,7 @@ function App() {
       previewRef.current?.applyDomPatch({
         text:               patch.text,
         href:               patch.href,
+        linkTarget:         patch.linkTarget,
         disabled:           patch.disabled,
         imageSrc:           patch.imageSrc,
         imageAlt:           patch.imageAlt,
@@ -261,10 +265,37 @@ function App() {
           pushAttr(el.imageAlt, patch.imageAlt)
           for (const { oldText, newText } of saves) {
             if (!oldText || !newText) continue
-            await handleTextSaved({ tagName: el.tagName, oldText, newText })
+            await handleTextSaved({
+              tagName:    el.tagName,
+              oldText,
+              newText,
+              sourceFile: el.hbSourceFile ?? undefined,
+              sourceLine: el.hbSourceLine ?? undefined,
+              sourceCol:  el.hbSourceCol  ?? undefined,
+            })
           }
         }
 
+        return
+      }
+
+      // ── Href save for mapped array card links ────────────────────────────────
+      // Card-level <a> elements carry hbItemId from data-hb-item-id={project.name}.
+      // Their href is the per-item `url` field in the data array — update only that
+      // item rather than running a project-wide text search.
+      if (patch.href !== undefined && el.hbItemId && el.hbSourceFile) {
+        const oldHref = (el.href ?? '').trim()
+        const newHref = patch.href.trim()
+        if (oldHref && newHref && newHref !== oldHref) {
+          console.log('[app] updateArrayItemText for href →', el.hbSourceFile, 'item', el.hbItemId)
+          const result = await window.api.updateArrayItemText({
+            filePath: el.hbSourceFile,
+            itemId:   el.hbItemId,
+            oldText:  oldHref,
+            newText:  newHref,
+          })
+          reportDirectWrite(result)
+        }
         return
       }
 
@@ -298,7 +329,16 @@ function App() {
 
       for (const { oldText, newText } of saves) {
         if (!oldText || !newText) continue
-        const result = await handleTextSaved({ tagName: el.tagName, oldText, newText })
+        const result = await handleTextSaved({
+          tagName:    el.tagName,
+          oldText,
+          newText,
+          sourceFile: el.hbSourceFile ?? undefined,
+          sourceLine: el.hbSourceLine ?? undefined,
+          sourceCol:  el.hbSourceCol  ?? undefined,
+          id:         el.id ?? undefined,
+          classList:  el.classList,
+        })
         if (result === 'needs-confirmation') return
       }
     },
@@ -320,6 +360,7 @@ function App() {
       saveStatus={saveStatus}
       saveResult={saveResult}
       pendingAnalysis={pendingAnalysis}
+      pendingAstBindings={pendingAstBindings}
       locatorPayload={locatorPayload}
       hbDiagnostic={hbDiagnostic}
       hbDiagnosticError={hbDiagnosticError}
@@ -335,6 +376,8 @@ function App() {
       onTextSaved={handleTextSaved}
       onConfirmMatch={handleConfirmMatch}
       onCancelConfirmation={handleCancelConfirmation}
+      onConfirmAstBinding={handleConfirmAstBinding}
+      onCancelAstPicker={handleCancelAstPicker}
       onInspectorSave={handleInspectorSave}
       onPickFile={handlePickFile}
       onLivePatch={handleLivePatch}

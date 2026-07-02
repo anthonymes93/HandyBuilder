@@ -12,7 +12,8 @@ import {
   LocatedEditParams,
   CommitParams
 } from '../editor/fileEditor'
-import { writeInlineStyle, WriteInlineStyleParams, writeArrayItemProp, WriteArrayItemPropParams } from '../editor/styleWriter'
+import { writeInlineStyle, WriteInlineStyleParams, writeArrayItemProp, WriteArrayItemPropParams, updateArrayItemText, UpdateArrayItemTextParams } from '../editor/styleWriter'
+import { astLocateBinding, AstLocateParams } from '../editor/astEditor'
 import {
   getMapping,
   saveMapping,
@@ -101,6 +102,16 @@ export function setupIpcHandlers(
   // Update a single property on a specific array item identified by a unique string value.
   ipcMain.handle('editor:write-array-item-prop', (_e: IpcMainInvokeEvent, params: WriteArrayItemPropParams) =>
     writeArrayItemProp(params)
+  )
+
+  // Update a text field value inside a specific array item (identified by a unique itemId string).
+  ipcMain.handle('editor:update-array-item-text', (_e: IpcMainInvokeEvent, params: UpdateArrayItemTextParams) =>
+    updateArrayItemText(params)
+  )
+
+  // Parse the source file AST and return all binding locations for a displayed text.
+  ipcMain.handle('editor:ast-locate-binding', (_e: IpcMainInvokeEvent, params: AstLocateParams) =>
+    astLocateBinding(params)
   )
 
   // Open a file in the system default editor (e.g. VS Code).

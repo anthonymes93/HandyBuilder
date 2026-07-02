@@ -58,6 +58,23 @@ export interface HandyBuilderAPI {
     propName: string
     propValue: string
   }) => Promise<{ success: boolean; filePath?: string; lineNumber?: number; error?: string }>
+  updateArrayItemText: (params: {
+    filePath: string
+    itemId: string
+    oldText: string
+    newText: string
+  }) => Promise<{ success: boolean; filePath?: string; lineNumber?: number; error?: string }>
+  astLocateBinding: (params: {
+    filePath: string
+    lineNumber: number
+    colNumber?: number | null
+    displayedOld: string
+    displayedNew: string
+  }) => Promise<{
+    success: boolean
+    bindings: import('.').AstBinding[]
+    reason: string
+  }>
   openFileInEditor: (filePath: string) => Promise<{ success: true } | { error: string }>
   showInFolder: (filePath: string) => Promise<void>
 }

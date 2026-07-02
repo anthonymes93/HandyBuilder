@@ -419,6 +419,113 @@ export function writeArrayItemProp(params: WriteArrayItemPropParams): WriteInlin
   return { success: true, filePath, lineNumber: writtenLine }
 }
 
+// ─── array item text writer ───────────────────────────────────────────────────
+
+export interface UpdateArrayItemTextParams {
+  filePath: string
+  /** The unique string that identifies the array item (e.g., the project name). */
+  itemId:   string
+  /** The current text value to find within the identified object (must be an exact match). */
+  oldText:  string
+  /** The replacement text. */
+  newText:  string
+}
+
+/**
+ * Find a specific array item by its unique string identifier, then locate
+ * `oldText` as a quoted property VALUE inside that object and replace it with
+ * `newText`.  Useful when mapped JSX renders `{item.category}` — the literal
+ * value lives in the data array, not in the JSX template.
+ *
+ * Searches for `oldText` using the pattern  `: 'oldText'` (or double quotes)
+ * so that property KEYS are never accidentally matched.
+ *
+ * Note: brace counting does not skip string contents; values containing `{`/`}`
+ * will confuse the scanner (not a concern for typical flat data arrays).
+ */
+export function updateArrayItemText(params: UpdateArrayItemTextParams): WriteInlineStyleResult {
+  const { filePath, itemId, oldText, newText } = params
+
+  let content: string
+  try {
+    content = fs.readFileSync(filePath, 'utf-8')
+  } catch (err) {
+    return { success: false, error: `Cannot read ${filePath}: ${String(err)}` }
+  }
+
+  // 1. Find itemId as a complete quoted string literal.
+  const idPattern = new RegExp(`(['"])${escapeRe(itemId)}\\1`)
+  const idMatch = idPattern.exec(content)
+  if (!idMatch) {
+    return { success: false, error: `Item "${itemId}" not found in ${filePath}` }
+  }
+  const idPos = idMatch.index
+
+  // 2. Scan backward from idPos to find the object's opening '{'.
+  let depth = 0, objOpenPos = -1
+  for (let i = idPos - 1; i >= 0; i--) {
+    const ch = content[i]
+    if (ch === '}') depth++
+    else if (ch === '{') {
+      if (depth === 0) { objOpenPos = i; break }
+      depth--
+    }
+  }
+  if (objOpenPos === -1) {
+    return { success: false, error: `Cannot find object start for item "${itemId}" in ${filePath}` }
+  }
+
+  // 3. Scan forward to find the matching closing '}'.
+  depth = 1
+  let objClosePos = -1
+  for (let i = objOpenPos + 1; i < content.length; i++) {
+    const ch = content[i]
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) { objClosePos = i; break }
+    }
+  }
+  if (objClosePos === -1) {
+    return { success: false, error: `Cannot find object end for item "${itemId}" in ${filePath}` }
+  }
+
+  // 4. Within the object, find oldText as a complete quoted property VALUE.
+  //    The `:` prefix ensures we match values, not property keys.
+  const objContent = content.slice(objOpenPos, objClosePos + 1)
+  const valuePattern = new RegExp(`:\\s*(['"])${escapeRe(oldText)}\\1`)
+  const valueMatch = valuePattern.exec(objContent)
+  if (!valueMatch) {
+    return {
+      success: false,
+      error: `"${oldText}" not found as a field value in the "${itemId}" object in ${filePath}`,
+    }
+  }
+
+  // Resolve the absolute position of the opening quote.
+  const quoteChar   = valueMatch[1]
+  const absMatchPos = objOpenPos + valueMatch.index
+  // valueMatch[0] starts at ':', ends after the closing quote; find the opening quote offset.
+  const quoteOffset  = valueMatch[0].indexOf(quoteChar)
+  const valueStart   = absMatchPos + quoteOffset        // position of opening quote
+  const valueEnd     = valueStart + 1 + oldText.length + 1  // skip quote + text + quote
+
+  const newContent =
+    content.slice(0, valueStart) +
+    quoteChar + newText + quoteChar +
+    content.slice(valueEnd)
+
+  try {
+    fs.writeFileSync(filePath, newContent, 'utf-8')
+  } catch (err) {
+    return { success: false, error: `Cannot write ${filePath}: ${String(err)}` }
+  }
+
+  const writtenLine = content.slice(0, valueStart).split('\n').length
+  console.log(`[styleWriter] updated text for "${itemId}" → "${newText}" in ${filePath}:${writtenLine}`)
+  return { success: true, filePath, lineNumber: writtenLine }
+}
+
 // ─── main export ─────────────────────────────────────────────────────────────
 
 export function writeInlineStyle(params: WriteInlineStyleParams): WriteInlineStyleResult {

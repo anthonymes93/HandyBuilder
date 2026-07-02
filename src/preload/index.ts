@@ -87,6 +87,23 @@ const api = {
     propValue: string
   }) => ipcRenderer.invoke('editor:write-array-item-prop', params),
 
+  /** Update a text field value inside a specific array item (find by itemId, replace oldText with newText). */
+  updateArrayItemText: (params: {
+    filePath: string
+    itemId: string
+    oldText: string
+    newText: string
+  }) => ipcRenderer.invoke('editor:update-array-item-text', params),
+
+  /** Parse the source file AST and resolve what produces the displayed text at a given line. */
+  astLocateBinding: (params: {
+    filePath: string
+    lineNumber: number
+    colNumber?: number | null
+    displayedOld: string
+    displayedNew: string
+  }) => ipcRenderer.invoke('editor:ast-locate-binding', params),
+
   /** Open a file in the system default editor (e.g. VS Code). */
   openFileInEditor: (filePath: string) => ipcRenderer.invoke('editor:open-file', filePath),
 

@@ -2,13 +2,14 @@ import type { RefObject } from 'react'
 import {
   Project, FileNode, DevServerStatus, SelectedElement,
   TextEditPayload, TextEditAnalysis, SourceMatch, SaveStatus,
-  InspectorSavePatch, ImagePickResult, SaveResult, CommitResult, DomPatch
+  InspectorSavePatch, ImagePickResult, SaveResult, CommitResult, DomPatch, AstBinding
 } from '../../types'
 import { Toolbar } from '../Toolbar/Toolbar'
 import { LeftSidebar } from '../LeftSidebar/LeftSidebar'
 import { PreviewPanel } from '../Preview/PreviewPanel'
 import { InspectorPanel } from '../Inspector/InspectorPanel'
 import { MatchConfirmPanel } from '../Editor/MatchConfirmPanel'
+import { BindingPickerPanel } from '../Editor/BindingPickerPanel'
 import { SourceLocatorPanel } from '../Editor/SourceLocatorPanel'
 import { SaveNotification } from '../Editor/SaveNotification'
 import type { PreviewFrameHandle } from '../Preview/PreviewPanel'
@@ -28,6 +29,7 @@ interface AppLayoutProps {
   saveStatus: SaveStatus
   saveResult: SaveResult
   pendingAnalysis: TextEditAnalysis | null
+  pendingAstBindings: AstBinding[]
   locatorPayload: TextEditPayload | null
   hbDiagnostic: HbInjectionDiagnostic | null
   hbDiagnosticError: string | null
@@ -43,6 +45,8 @@ interface AppLayoutProps {
   onTextSaved: (payload: TextEditPayload) => void
   onConfirmMatch: (match: SourceMatch) => void
   onCancelConfirmation: () => void
+  onConfirmAstBinding: (binding: AstBinding) => void
+  onCancelAstPicker: () => void
   onInspectorSave: (patch: InspectorSavePatch) => void
   onPickFile: () => Promise<ImagePickResult | null>
   onLivePatch: (patch: DomPatch) => void
@@ -69,6 +73,7 @@ export function AppLayout({
   saveStatus,
   saveResult,
   pendingAnalysis,
+  pendingAstBindings,
   locatorPayload,
   hbDiagnostic,
   hbDiagnosticError,
@@ -84,6 +89,8 @@ export function AppLayout({
   onTextSaved,
   onConfirmMatch,
   onCancelConfirmation,
+  onConfirmAstBinding,
+  onCancelAstPicker,
   onInspectorSave,
   onPickFile,
   onLivePatch,
@@ -96,9 +103,10 @@ export function AppLayout({
   onShowInFolder,
 }: AppLayoutProps) {
   const showConfirmPanel  = saveStatus === 'needs-confirmation' && pendingAnalysis !== null
-  const showLocator       = !!locatorPayload && !showConfirmPanel
+  const showBindingPicker = saveStatus === 'needs-binding-picker' && pendingAstBindings.length > 0
+  const showLocator       = !!locatorPayload && !showConfirmPanel && !showBindingPicker
 
-  console.log('[layout] render — saveStatus:', saveStatus, '| locatorPayload:', !!locatorPayload, '| showLocator:', showLocator, '| showConfirmPanel:', showConfirmPanel)
+  console.log('[layout] render — saveStatus:', saveStatus, '| locatorPayload:', !!locatorPayload, '| showLocator:', showLocator, '| showConfirmPanel:', showConfirmPanel, '| showBindingPicker:', showBindingPicker)
 
   function rightPanel() {
     if (showConfirmPanel) {
@@ -109,6 +117,16 @@ export function AppLayout({
           projectPath={project?.path ?? ''}
           onConfirm={onConfirmMatch}
           onCancel={onCancelConfirmation}
+        />
+      )
+    }
+    if (showBindingPicker) {
+      console.log('[layout] rightPanel → BindingPickerPanel')
+      return (
+        <BindingPickerPanel
+          bindings={pendingAstBindings}
+          onConfirm={onConfirmAstBinding}
+          onCancel={onCancelAstPicker}
         />
       )
     }

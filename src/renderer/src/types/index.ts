@@ -1,3 +1,17 @@
+// ─── AST binding ─────────────────────────────────────────────────────────────
+
+export interface AstBinding {
+  kind: 'jsx-text' | 'jsx-text-partial' | 'identifier' | 'member' | 'jsx-attr' | 'jsx-attr-member'
+  description: string
+  filePath: string
+  lineNumber: number
+  oldText: string
+  newText: string
+  matchOffset: number
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export interface FileNode {
   name: string
   path: string
@@ -51,6 +65,7 @@ export interface SelectedElement {
   computed: ComputedStyles
   // Link / button
   href?: string | null
+  linkTarget?: string | null
   inputType?: string | null
   disabled?: boolean
   value?: string | null
@@ -67,6 +82,8 @@ export interface SelectedElement {
   hbComponentName?: string | null
   // Per-item identifier for elements inside .map() (from data-hb-item-id attribute)
   hbItemId?: string | null
+  // Set when a click was resolved up to a closer ancestor (e.g. 'div' means div → a)
+  resolvedFrom?: string | null
 }
 
 /** Typed interface for Electron's <webview> element used in PreviewPanel. */
@@ -110,6 +127,8 @@ export interface TextEditPayload {
   editedText?: string
   editedTextContentSample?: string
   editedElementHasChildren?: boolean
+  // Per-item identifier for elements inside .map() (from data-hb-item-id, walked up DOM)
+  hbItemId?: string | null
 }
 
 export type MatchStrategy = 'exact' | 'normalized' | 'jsx-word-proximity'
@@ -190,6 +209,8 @@ export interface SaveResult {
   retryPayload?: TextEditPayload
   /** Populated when status is dom-only; shows why the search failed. */
   debugInfo?: SaveDebugInfo
+  /** Populated when status is needs-binding-picker; multiple AST bindings found. */
+  astBindings?: AstBinding[]
 }
 
 /** A patch the host sends the bridge to apply to the selected DOM element. */
@@ -197,6 +218,7 @@ export interface DomPatch {
   // text / link / button
   text?: string
   href?: string
+  linkTarget?: string
   disabled?: boolean
   // image
   imageSrc?: string
@@ -217,6 +239,7 @@ export interface InspectorSavePatch {
   // text / link / button
   text?: string
   href?: string
+  linkTarget?: string
   disabled?: boolean
   // image
   imageSrc?: string
@@ -257,4 +280,5 @@ export type SaveStatus =
   | 'saved'
   | 'dom-only'
   | 'needs-confirmation'
+  | 'needs-binding-picker'
   | 'failed'

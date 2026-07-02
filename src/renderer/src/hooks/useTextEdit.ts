@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import {
   Project, TextEditPayload, TextEditAnalysis, SourceMatch,
-  SaveStatus, SaveResult, CommitResult
+  SaveStatus, SaveResult, CommitResult, AstBinding
 } from '../types'
 
 /** Build a stable element key for mapping lookup. */
@@ -19,9 +19,12 @@ export interface UseTextEditReturn {
   saveStatus: SaveStatus
   saveResult: SaveResult
   pendingAnalysis: TextEditAnalysis | null
+  pendingAstBindings: AstBinding[]
   handleTextSaved: (payload: TextEditPayload) => Promise<SaveStatus>
   handleConfirmMatch: (match: SourceMatch) => Promise<void>
   handleCancelConfirmation: () => void
+  handleConfirmAstBinding: (binding: AstBinding) => Promise<void>
+  handleCancelAstPicker: () => void
   handleManualCommit: (match: SourceMatch, newText: string) => Promise<CommitResult>
   retryLastSave: () => Promise<void>
   dismissSaveResult: () => void
@@ -59,8 +62,9 @@ const IDLE: SaveResult = { status: 'idle' }
 // ─── hook ─────────────────────────────────────────────────────────────────────
 
 export function useTextEdit(project: Project | null): UseTextEditReturn {
-  const [saveResult, setSaveResult]          = useState<SaveResult>(IDLE)
-  const [pendingAnalysis, setPendingAnalysis] = useState<TextEditAnalysis | null>(null)
+  const [saveResult, setSaveResult]              = useState<SaveResult>(IDLE)
+  const [pendingAnalysis, setPendingAnalysis]     = useState<TextEditAnalysis | null>(null)
+  const [pendingAstBindings, setPendingAstBindings] = useState<AstBinding[]>([])
 
   const saveStatus: SaveStatus = saveResult.status
 
@@ -111,9 +115,6 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
 
           if (located.matchCount >= 1) {
             // Use the first (highest-confidence) match for auto-commit.
-            // analyzeLocatedEdit never returns more than the matches within the
-            // window, so even multiple hits are likely in the same block — just
-            // take the first one.
             const match = located.matches[0]
             console.log('[useTextEdit] located → committing', match.filePath, 'line', match.lineNumber)
 
@@ -140,48 +141,160 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
               return 'saved'
             }
 
+            // Located commit failed — open SourceLocatorPanel.
             console.warn('[useTextEdit] located commit failed:', result.error)
-            // Fall through to dom-only (don't run project-wide search when we
-            // know the file but the write failed — better to show the locator).
-          }
+            const locatedDebug = located.debugInfo
+            setSaveResult({
+              status: 'dom-only',
+              retryPayload: payload,
+              debugInfo: {
+                originalText: payload.oldText,
+                normalizedText: locatedDebug?.normalizedSearchText ?? payload.oldText.trim(),
+                filesScanned: locatedDebug?.filesScanned ?? 1,
+                extensions: locatedDebug?.extensionsSearched ?? [],
+                projectPath: project.path,
+                strategy: locatedDebug?.strategy ?? 'none',
+                sourceFile: locatedDebug?.sourceFile ?? payload.sourceFile,
+                originalLine: locatedDebug?.originalLine ?? payload.sourceLine,
+                searchedFromLine: locatedDebug?.searchedFromLine,
+                searchedToLine: locatedDebug?.searchedToLine,
+                oldTextSent: payload.oldText,
+                newTextSent: payload.newText,
+                editedTagName: payload.editedTagName,
+                editedTextContentSample: payload.editedTextContentSample,
+                editedElementHasChildren: payload.editedElementHasChildren,
+              },
+            })
+            scheduleClear(30_000)
+            return 'dom-only'
 
-          // 0 matches near the line, or commit failed: open SourceLocatorPanel
-          // with this file already selected (payload.sourceFile is passed through).
-          const locatedDebug = located.debugInfo
-          setSaveResult({
-            status: 'dom-only',
-            retryPayload: payload,
-            debugInfo: {
-              originalText: payload.oldText,
-              normalizedText: locatedDebug?.normalizedSearchText ?? payload.oldText.trim(),
-              filesScanned: locatedDebug?.filesScanned ?? 1,
-              extensions: locatedDebug?.extensionsSearched ?? [],
-              projectPath: project.path,
-              strategy: locatedDebug?.strategy ?? 'none',
-              sourceFile: locatedDebug?.sourceFile ?? payload.sourceFile,
-              originalLine: locatedDebug?.originalLine ?? payload.sourceLine,
-              searchedFromLine: locatedDebug?.searchedFromLine,
-              searchedToLine: locatedDebug?.searchedToLine,
-              oldTextSent: payload.oldText,
-              newTextSent: payload.newText,
-              editedTagName: payload.editedTagName,
-              editedTextContentSample: payload.editedTextContentSample,
-              editedElementHasChildren: payload.editedElementHasChildren,
-            },
-          })
-          scheduleClear(30_000)
-          return 'dom-only'
+          } else {
+            // 0 matches near the JSX line — text comes from a data structure
+            // (e.g., `{project.category}` in a .map()), not a literal in JSX.
+
+            // Strategy A: if element is inside a mapped array card (hbItemId available),
+            // update the specific array item field directly — no ambiguity.
+            if (payload.hbItemId) {
+              try {
+                const arrayResult = await withTimeout(
+                  window.api.updateArrayItemText({
+                    filePath: payload.sourceFile,
+                    itemId:   payload.hbItemId,
+                    oldText:  payload.oldText.trim(),
+                    newText:  payload.newText.trim(),
+                  }),
+                  SAVE_TIMEOUT_MS,
+                  'updateArrayItemText'
+                )
+                if (arrayResult.success && arrayResult.filePath) {
+                  setSaveResult({
+                    status:       'saved',
+                    filePath:     arrayResult.filePath,
+                    relativePath: toRelative(arrayResult.filePath, project.path),
+                    lineNumber:   arrayResult.lineNumber,
+                  })
+                  scheduleClear(10_000)
+                  return 'saved'
+                }
+                console.warn('[useTextEdit] updateArrayItemText failed:', arrayResult.error)
+              } catch (err) {
+                console.warn('[useTextEdit] updateArrayItemText threw:', err instanceof Error ? err.message : String(err))
+              }
+            }
+
+            // Strategy B: AST binding resolver — parse the source file and find
+            // the exact source location that produces the displayed text.
+            console.log('[useTextEdit] located 0 matches → AST binding resolver')
+            try {
+              const astResult = await withTimeout(
+                window.api.astLocateBinding({
+                  filePath:     payload.sourceFile,
+                  lineNumber:   payload.sourceLine,
+                  colNumber:    payload.sourceCol ?? null,
+                  displayedOld: payload.oldText.trim(),
+                  displayedNew: payload.newText.trim(),
+                }),
+                SAVE_TIMEOUT_MS,
+                'astLocateBinding'
+              )
+
+              console.log(`[useTextEdit] astLocateBinding: ${astResult.bindings.length} binding(s) — ${astResult.reason}`)
+
+              if (astResult.bindings.length === 1) {
+                // Single binding — auto-commit directly
+                const b = astResult.bindings[0]
+                const result = await withTimeout(
+                  window.api.commitTextEdit({
+                    filePath:        b.filePath,
+                    oldText:         b.oldText,
+                    newText:         b.newText,
+                    actualMatchText: b.oldText,
+                    matchOffset:     b.matchOffset,
+                  }),
+                  SAVE_TIMEOUT_MS,
+                  'commitTextEdit (ast-binding)'
+                )
+                if (result.success && result.filePath) {
+                  setSaveResult({
+                    status:       'saved',
+                    filePath:     result.filePath,
+                    relativePath: toRelative(result.filePath, project.path),
+                    lineNumber:   result.lineNumber,
+                  })
+                  scheduleClear(10_000)
+                  return 'saved'
+                }
+                console.warn('[useTextEdit] ast-binding commit failed:', result.error)
+              } else if (astResult.bindings.length > 1) {
+                // Multiple interpretations — show binding picker
+                setPendingAstBindings(astResult.bindings)
+                setSaveResult({ status: 'needs-binding-picker', astBindings: astResult.bindings })
+                return 'needs-binding-picker' as SaveStatus
+              }
+              // 0 bindings — text is likely an imported constant or cross-file prop.
+              // Project-wide search will also fail for the same reason, so surface
+              // a dom-only result now with enough detail for the user to debug.
+              console.log('[useTextEdit] AST found 0 bindings —', astResult.reason)
+              setSaveResult({
+                status: 'dom-only',
+                retryPayload: payload,
+                debugInfo: {
+                  originalText:   payload.oldText,
+                  normalizedText: payload.oldText.replace(/\s+/g, ' ').trim(),
+                  filesScanned:   1,
+                  extensions:     ['.tsx', '.ts', '.jsx', '.js'],
+                  projectPath:    project.path,
+                  strategy:       'ast-0-bindings',
+                  sourceFile:     payload.sourceFile,
+                  originalLine:   payload.sourceLine,
+                  oldTextSent:    payload.oldText,
+                  newTextSent:    payload.newText,
+                  editedTagName:  payload.editedTagName,
+                },
+              })
+              scheduleClear(30_000)
+              return 'dom-only'
+            } catch (err) {
+              console.warn('[useTextEdit] astLocateBinding threw:', err instanceof Error ? err.message : String(err))
+            }
+
+            // Strategy C: fall through to project-wide search biased toward this file.
+            console.log('[useTextEdit] AST threw → project-wide search in', payload.sourceFile)
+          }
         }
 
         // ── 1. find all source matches ─────────────────────────────────────
-        console.log('[useTextEdit] using located edit: false → project-wide search', {
+        console.log('[useTextEdit] project-wide search', {
           old: payload.oldText.slice(0, 60),
           new: payload.newText.slice(0, 60),
           projectPath: project.path,
         })
 
-        // Check for a stored mapping — boosts confidence of the previously-linked file
-        let preferredFile: string | undefined
+        // When falling through from a failed located edit, bias toward the source file.
+        // Also check for a stored mapping — overrides the source-file preference.
+        let preferredFile: string | undefined = payload.sourceFile && payload.sourceLine
+          ? payload.sourceFile
+          : undefined
         if (payload.tagName && payload.oldText.trim()) {
           const key = buildElementKey(payload.tagName, payload.id, payload.classList)
           if (key && key !== payload.tagName) {  // non-trivial key
@@ -359,6 +472,52 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
     [pendingAnalysis, project]
   )
 
+  // ── user picks a specific AST binding from the BindingPickerPanel ────────
+
+  const handleConfirmAstBinding = useCallback(
+    async (binding: AstBinding): Promise<void> => {
+      if (clearTimerRef.current) clearTimeout(clearTimerRef.current)
+      setSaveResult({ status: 'saving' })
+      setPendingAstBindings([])
+      try {
+        const result = await withTimeout(
+          window.api.commitTextEdit({
+            filePath:        binding.filePath,
+            oldText:         binding.oldText,
+            newText:         binding.newText,
+            actualMatchText: binding.oldText,
+            matchOffset:     binding.matchOffset,
+          }),
+          SAVE_TIMEOUT_MS,
+          'commitTextEdit (ast-binding-picked)'
+        )
+        if (result.success && result.filePath) {
+          setSaveResult({
+            status:       'saved',
+            filePath:     result.filePath,
+            relativePath: toRelative(result.filePath, project?.path),
+            lineNumber:   result.lineNumber,
+          })
+          scheduleClear(10_000)
+        } else {
+          setSaveResult({ status: 'failed', error: result.error ?? 'Binding write failed' })
+          scheduleClear(30_000)
+        }
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err)
+        setSaveResult({ status: 'failed', error })
+        scheduleClear(30_000)
+      }
+    },
+    [project]
+  )
+
+  const handleCancelAstPicker = useCallback(() => {
+    setPendingAstBindings([])
+    setSaveResult({ status: 'dom-only' })
+    scheduleClear(30_000)
+  }, [])
+
   // ── user cancels the match-confirmation panel ────────────────────────────
 
   const handleCancelConfirmation = useCallback(() => {
@@ -458,9 +617,12 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
     saveStatus,
     saveResult,
     pendingAnalysis,
+    pendingAstBindings,
     handleTextSaved,
     handleConfirmMatch,
     handleCancelConfirmation,
+    handleConfirmAstBinding,
+    handleCancelAstPicker,
     handleManualCommit,
     retryLastSave,
     dismissSaveResult,
