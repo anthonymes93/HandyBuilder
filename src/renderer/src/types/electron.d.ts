@@ -46,6 +46,18 @@ export interface HandyBuilderAPI {
   saveElementMapping: (params: { projectPath: string; mapping: ElementMapping }) => Promise<void>
   pickImageFile: () => Promise<ImagePickResult | { error: string } | null>
   readProjectFile: (params: { filePath: string; projectPath: string }) => Promise<{ content: string } | { error: string }>
+  writeInlineStyle: (params: {
+    filePath: string
+    lineNumber: number
+    styleProps: Record<string, string>
+    tagName?: string
+  }) => Promise<{ success: boolean; filePath?: string; lineNumber?: number; error?: string }>
+  writeArrayItemProp: (params: {
+    filePath: string
+    itemId: string
+    propName: string
+    propValue: string
+  }) => Promise<{ success: boolean; filePath?: string; lineNumber?: number; error?: string }>
   openFileInEditor: (filePath: string) => Promise<{ success: true } | { error: string }>
   showInFolder: (filePath: string) => Promise<void>
 }

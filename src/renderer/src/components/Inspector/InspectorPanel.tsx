@@ -1,9 +1,9 @@
 import type { ReactNode, ChangeEvent } from 'react'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   SlidersHorizontal, X, Link2, MousePointerClick, ImageIcon, FolderOpen, AlertTriangle, MapPin
 } from 'lucide-react'
-import { SelectedElement, InspectorSavePatch, SaveStatus, ImagePickResult } from '../../types'
+import { SelectedElement, InspectorSavePatch, SaveStatus, ImagePickResult, DomPatch } from '../../types'
 import { classifyElement, isEditable, ElementKind } from '../../utils/elementKind'
 import { SaveStatusBadge } from '../Editor/SaveStatusBadge'
 
@@ -90,7 +90,139 @@ function buildBgUrl(url: string): string {
   return u ? `url("${u}")` : ''
 }
 
-const OBJECT_FIT_OPTIONS = ['', 'fill', 'contain', 'cover', 'none', 'scale-down']
+function parsePosKeyword(s: string): number {
+  if (s === 'left' || s === 'top') return 0
+  if (s === 'right' || s === 'bottom') return 100
+  if (s === 'center') return 50
+  const n = parseFloat(s)
+  return isNaN(n) ? 50 : Math.round(n)
+}
+
+function parsePosition(pos: string): [number, number] {
+  if (!pos || pos === 'initial' || pos === 'normal' || pos === 'none') return [50, 50]
+  const parts = pos.trim().split(/\s+/)
+  if (parts.length >= 2) return [parsePosKeyword(parts[0]), parsePosKeyword(parts[1])]
+  const p = parsePosKeyword(parts[0])
+  return [p, 50]
+}
+
+// Derive fit + zoom from background-size computed value.
+// Chrome normalises "150%" → "150% auto", so we match the first percentage.
+function parseBgSize(bgSize: string): [string, number] {
+  if (!bgSize || bgSize === 'auto' || bgSize === 'auto auto') return ['none', 100]
+  if (bgSize === 'cover') return ['cover', 100]
+  if (bgSize === 'contain') return ['contain', 100]
+  if (bgSize === '100% 100%') return ['fill', 100]
+  const m = bgSize.match(/^([\d.]+)%/)
+  if (m) return ['cover', Math.round(parseFloat(m[1]))]
+  return ['cover', 100]
+}
+
+// Chrome may return scale(1.5) or matrix(1.5, 0, 0, 1.5, 0, 0).
+function parseTransformScale(transform: string): number {
+  if (!transform || transform === 'none') return 100
+  const s = transform.match(/^scale\(([\d.]+)\)/)
+  if (s) return Math.round(parseFloat(s[1]) * 100)
+  const m = transform.match(/^matrix\(([\d.]+)/)
+  if (m) return Math.round(parseFloat(m[1]) * 100)
+  return 100
+}
+
+function computeBgSize(fit: string, zoom: number): string {
+  if (fit === 'contain') return 'contain'
+  if (fit === 'fill') return '100% 100%'
+  if (fit === 'none' && zoom === 100) return 'auto'
+  if (fit === 'cover' && zoom === 100) return 'cover'
+  return `${zoom}%`
+}
+
+const FIT_OPTIONS = ['cover', 'contain', 'fill', 'none'] as const
+
+const GRID_ANCHORS = [
+  { x: 0,   y: 0,   label: 'Top Left' },
+  { x: 50,  y: 0,   label: 'Top Center' },
+  { x: 100, y: 0,   label: 'Top Right' },
+  { x: 0,   y: 50,  label: 'Center Left' },
+  { x: 50,  y: 50,  label: 'Center' },
+  { x: 100, y: 50,  label: 'Center Right' },
+  { x: 0,   y: 100, label: 'Bottom Left' },
+  { x: 50,  y: 100, label: 'Bottom Center' },
+  { x: 100, y: 100, label: 'Bottom Right' },
+]
+
+// ─── focal point picker ───────────────────────────────────────────────────────
+
+function FocalPointPicker({
+  imgUrl, focalX, focalY, onChange,
+}: {
+  imgUrl: string
+  focalX: number
+  focalY: number
+  onChange: (x: number, y: number) => void
+}) {
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  function startDrag(e: React.MouseEvent<HTMLDivElement>) {
+    e.preventDefault()
+    const rect = containerRef.current!.getBoundingClientRect()
+
+    function clamped(cx: number, cy: number): [number, number] {
+      return [
+        Math.round(Math.max(0, Math.min(100, ((cx - rect.left) / rect.width) * 100))),
+        Math.round(Math.max(0, Math.min(100, ((cy - rect.top)  / rect.height) * 100))),
+      ]
+    }
+
+    onChange(...clamped(e.clientX, e.clientY))
+
+    function onMove(me: MouseEvent) { onChange(...clamped(me.clientX, me.clientY)) }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  return (
+    <div
+      ref={containerRef}
+      className="relative w-full overflow-hidden rounded border border-gray-700 cursor-crosshair select-none"
+      style={{ height: 72 }}
+      onMouseDown={startDrag}
+    >
+      {/* Checkerboard background when no image */}
+      <div
+        className="absolute inset-0"
+        style={{
+          backgroundImage: 'repeating-conic-gradient(#374151 0% 25%, #1f2937 0% 50%)',
+          backgroundSize: '12px 12px',
+        }}
+      />
+      {imgUrl && (
+        <img
+          src={imgUrl}
+          alt=""
+          draggable={false}
+          className="absolute inset-0 w-full h-full pointer-events-none"
+          style={{ objectFit: 'cover', objectPosition: `${focalX}% ${focalY}%` }}
+        />
+      )}
+      {/* Crosshair lines */}
+      <div className="absolute inset-0 pointer-events-none">
+        <div className="absolute top-0 bottom-0 w-px bg-white/30" style={{ left: `${focalX}%` }} />
+        <div className="absolute left-0 right-0 h-px bg-white/30" style={{ top: `${focalY}%` }} />
+        <div
+          className="absolute w-3 h-3 rounded-full border-2 border-white -translate-x-1/2 -translate-y-1/2"
+          style={{ left: `${focalX}%`, top: `${focalY}%`, background: 'rgba(59,130,246,0.9)', boxShadow: '0 0 0 1px rgba(0,0,0,0.4)' }}
+        />
+      </div>
+      <span className="absolute bottom-0.5 right-1 text-[9px] text-white/40 font-mono pointer-events-none">
+        {focalX}% {focalY}%
+      </span>
+    </div>
+  )
+}
 
 // ─── image section ────────────────────────────────────────────────────────────
 
@@ -99,46 +231,100 @@ interface ImageSectionProps {
   saveStatus: SaveStatus
   onSave: (patch: InspectorSavePatch) => void
   onPickFile: () => Promise<ImagePickResult | null>
+  onLivePatch: (patch: DomPatch) => void
 }
 
-function ImageSection({ element, saveStatus, onSave, onPickFile }: ImageSectionProps) {
+function ImageSection({ element, saveStatus, onSave, onPickFile, onLivePatch }: ImageSectionProps) {
   const isImg = element.tagName === 'img'
   const hasBg = element.computed.backgroundImage !== 'none' && element.computed.backgroundImage !== ''
 
-  // Originals
-  const origSrc       = element.imageSrc    ?? ''
-  const origAlt       = element.imageAlt    ?? ''
-  const origWidth     = element.imageWidth  ?? ''
-  const origHeight    = element.imageHeight ?? ''
-  const origObjectFit = element.computed.objectFit ?? ''
-  const origBgUrl     = extractBgUrl(element.computed.backgroundImage ?? '')
+  // ── Stable "original" values derived from the element prop ─────────────────
+  const origSrc    = element.imageSrc    ?? ''
+  const origAlt    = element.imageAlt    ?? ''
+  const origWidth  = element.imageWidth  ?? ''
+  const origHeight = element.imageHeight ?? ''
+  const origBgUrl  = extractBgUrl(element.computed.backgroundImage ?? '')
 
-  const [draftSrc,       setDraftSrc]       = useState(origSrc)
-  const [draftAlt,       setDraftAlt]       = useState(origAlt)
-  const [draftWidth,     setDraftWidth]     = useState(origWidth)
-  const [draftHeight,    setDraftHeight]    = useState(origHeight)
-  const [draftObjectFit, setDraftObjectFit] = useState(origObjectFit)
-  const [draftBgUrl,     setDraftBgUrl]     = useState(origBgUrl)
-  const [picking,        setPicking]        = useState(false)
+  // Derive fit / zoom / focal from computed styles
+  const [initFit, initZoom] = isImg
+    ? [element.computed.objectFit || 'cover', parseTransformScale(element.computed.transform ?? '')]
+    : parseBgSize(element.computed.backgroundSize ?? '')
+  const [initFX, initFY] = isImg
+    ? parsePosition(element.computed.objectPosition ?? '50% 50%')
+    : parsePosition(element.computed.backgroundPosition ?? '50% 50%')
+
+  const [draftSrc,    setDraftSrc]    = useState(origSrc)
+  const [draftAlt,    setDraftAlt]    = useState(origAlt)
+  const [draftWidth,  setDraftWidth]  = useState(origWidth)
+  const [draftHeight, setDraftHeight] = useState(origHeight)
+  const [draftBgUrl,  setDraftBgUrl]  = useState(origBgUrl)
+  const [draftFit,    setDraftFit]    = useState(initFit)
+  const [draftZoom,   setDraftZoom]   = useState(initZoom)
+  const [draftFX,     setDraftFX]     = useState(initFX)
+  const [draftFY,     setDraftFY]     = useState(initFY)
+  const [picking,     setPicking]     = useState(false)
 
   useEffect(() => {
     setDraftSrc(element.imageSrc ?? '')
     setDraftAlt(element.imageAlt ?? '')
     setDraftWidth(element.imageWidth ?? '')
     setDraftHeight(element.imageHeight ?? '')
-    setDraftObjectFit(element.computed.objectFit ?? '')
     setDraftBgUrl(extractBgUrl(element.computed.backgroundImage ?? ''))
+    if (isImg) {
+      setDraftFit(element.computed.objectFit || 'cover')
+      setDraftZoom(parseTransformScale(element.computed.transform ?? ''))
+      const [fx, fy] = parsePosition(element.computed.objectPosition ?? '50% 50%')
+      setDraftFX(fx); setDraftFY(fy)
+    } else {
+      const [fit, zoom] = parseBgSize(element.computed.backgroundSize ?? '')
+      setDraftFit(fit); setDraftZoom(zoom)
+      const [fx, fy] = parsePosition(element.computed.backgroundPosition ?? '50% 50%')
+      setDraftFX(fx); setDraftFY(fy)
+    }
   }, [element])
 
-  const srcChanged       = draftSrc.trim()       !== origSrc.trim()
-  const altChanged       = draftAlt.trim()       !== origAlt.trim()
-  const widthChanged     = draftWidth.trim()     !== origWidth.trim()
-  const heightChanged    = draftHeight.trim()    !== origHeight.trim()
-  const objectFitChanged = draftObjectFit        !== origObjectFit
-  const bgUrlChanged     = draftBgUrl.trim()     !== origBgUrl.trim()
-  const hasChanges       = srcChanged || altChanged || widthChanged || heightChanged
-    || objectFitChanged || bgUrlChanged
+  // ── Live DOM patch builder ─────────────────────────────────────────────────
+  function livePatch(fit: string, zoom: number, fx: number, fy: number): DomPatch {
+    const pos = `${fx}% ${fy}%`
+    if (isImg) {
+      return {
+        objectFit: fit,
+        objectPosition: pos,
+        transform: zoom !== 100 ? `scale(${zoom / 100})` : 'none',
+      }
+    }
+    return {
+      backgroundSize: computeBgSize(fit, zoom),
+      backgroundPosition: pos,
+    }
+  }
 
+  function patchFit(fit: string) {
+    setDraftFit(fit)
+    onLivePatch(livePatch(fit, draftZoom, draftFX, draftFY))
+  }
+  function patchZoom(zoom: number) {
+    setDraftZoom(zoom)
+    onLivePatch(livePatch(draftFit, zoom, draftFX, draftFY))
+  }
+  function patchFocal(fx: number, fy: number) {
+    setDraftFX(fx); setDraftFY(fy)
+    onLivePatch(livePatch(draftFit, draftZoom, fx, fy))
+  }
+
+  // ── Change detection ───────────────────────────────────────────────────────
+  const srcChanged    = draftSrc.trim()    !== origSrc.trim()
+  const altChanged    = draftAlt.trim()    !== origAlt.trim()
+  const widthChanged  = draftWidth.trim()  !== origWidth.trim()
+  const heightChanged = draftHeight.trim() !== origHeight.trim()
+  const bgUrlChanged  = draftBgUrl.trim()  !== origBgUrl.trim()
+  const fitChanged    = draftFit           !== initFit
+  const zoomChanged   = draftZoom          !== initZoom
+  const focalChanged  = draftFX !== initFX || draftFY !== initFY
+  const hasChanges    = srcChanged || altChanged || widthChanged || heightChanged
+    || bgUrlChanged || fitChanged || zoomChanged || focalChanged
+
+  // ── Actions ────────────────────────────────────────────────────────────────
   async function handlePickFile() {
     setPicking(true)
     try {
@@ -153,30 +339,45 @@ function ImageSection({ element, saveStatus, onSave, onPickFile }: ImageSectionP
   }
 
   function handleSave() {
+    const pos = `${draftFX}% ${draftFY}%`
     const patch: InspectorSavePatch = { element }
+
     if (isImg) {
-      if (srcChanged)       patch.imageSrc    = draftSrc.trim()
-      if (altChanged)       patch.imageAlt    = draftAlt.trim()
-      if (widthChanged)     patch.imageWidth  = draftWidth.trim()
-      if (heightChanged)    patch.imageHeight = draftHeight.trim()
-      if (objectFitChanged) patch.objectFit   = draftObjectFit
-    } else if (hasBg) {
-      if (bgUrlChanged)     patch.backgroundImage = buildBgUrl(draftBgUrl)
-      if (objectFitChanged) patch.objectFit        = draftObjectFit
+      if (srcChanged)    patch.imageSrc     = draftSrc.trim()
+      if (altChanged)    patch.imageAlt     = draftAlt.trim()
+      if (widthChanged)  patch.imageWidth   = draftWidth.trim()
+      if (heightChanged) patch.imageHeight  = draftHeight.trim()
+      // Always write the complete display-style set atomically so the source
+      // reflects exactly what's shown (writeInlineStyle will merge these).
+      patch.objectFit      = draftFit
+      patch.objectPosition = pos
+      patch.transform      = draftZoom !== 100 ? `scale(${draftZoom / 100})` : 'none'
+    } else {
+      if (bgUrlChanged) patch.backgroundImage = buildBgUrl(draftBgUrl)
+      // Always write the complete set so backgroundSize + backgroundPosition
+      // stay consistent in the source file.
+      patch.backgroundSize     = computeBgSize(draftFit, draftZoom)
+      patch.backgroundPosition = pos
     }
+
     onSave(patch)
   }
 
-  function handleCancel() {
-    setDraftSrc(origSrc)
-    setDraftAlt(origAlt)
-    setDraftWidth(origWidth)
-    setDraftHeight(origHeight)
-    setDraftObjectFit(origObjectFit)
-    setDraftBgUrl(origBgUrl)
+  function handleReset() {
+    setDraftFit('cover'); setDraftZoom(100); setDraftFX(50); setDraftFY(50)
+    onLivePatch(livePatch('cover', 100, 50, 50))
   }
 
-  // SVG / picture: not field-editable, show info only
+  function handleCancel() {
+    setDraftSrc(origSrc); setDraftAlt(origAlt)
+    setDraftWidth(origWidth); setDraftHeight(origHeight)
+    setDraftBgUrl(origBgUrl)
+    setDraftFit(initFit); setDraftZoom(initZoom)
+    setDraftFX(initFX); setDraftFY(initFY)
+    onLivePatch(livePatch(initFit, initZoom, initFX, initFY))
+  }
+
+  // SVG / picture: not editable
   if (!isImg && !hasBg) {
     return (
       <Section title="Image">
@@ -187,6 +388,8 @@ function ImageSection({ element, saveStatus, onSave, onPickFile }: ImageSectionP
     )
   }
 
+  const thumbUrl = isImg ? draftSrc : draftBgUrl
+
   return (
     <div className="px-3 py-2 border-b border-gray-800/60">
       <div className="flex items-center gap-1.5 mb-2">
@@ -194,7 +397,13 @@ function ImageSection({ element, saveStatus, onSave, onPickFile }: ImageSectionP
         <p className="text-[10px] text-gray-700 uppercase tracking-widest font-medium">Image</p>
       </div>
 
-      {/* Src / bg url row with file picker */}
+      {/* Focal point — interactive thumbnail */}
+      <div className="mb-2">
+        <p className="text-[10px] text-gray-600 mb-1">Focal Point</p>
+        <FocalPointPicker imgUrl={thumbUrl} focalX={draftFX} focalY={draftFY} onChange={patchFocal} />
+      </div>
+
+      {/* Src / URL with file picker */}
       <div className="mb-2">
         <p className="text-[10px] text-gray-600 mb-1">{isImg ? 'Src' : 'Background URL'}</p>
         <div className="flex gap-1">
@@ -208,7 +417,7 @@ function ImageSection({ element, saveStatus, onSave, onPickFile }: ImageSectionP
           <button
             onClick={handlePickFile}
             disabled={picking}
-            title="Choose image from project folder"
+            title="Choose image file"
             className="px-2 py-1.5 bg-gray-800 border border-gray-700 hover:border-gray-600 hover:bg-gray-700 rounded text-gray-400 hover:text-gray-200 transition-colors disabled:opacity-40"
           >
             <FolderOpen className="w-3.5 h-3.5" />
@@ -216,14 +425,9 @@ function ImageSection({ element, saveStatus, onSave, onPickFile }: ImageSectionP
         </div>
       </div>
 
-      {/* Alt text — img only */}
+      {/* Alt — img only */}
       {isImg && (
-        <EditField
-          label="Alt text"
-          value={draftAlt}
-          placeholder="Describe the image…"
-          onChange={setDraftAlt}
-        />
+        <EditField label="Alt text" value={draftAlt} placeholder="Describe the image…" onChange={setDraftAlt} />
       )}
 
       {/* Width / height — img only */}
@@ -231,43 +435,91 @@ function ImageSection({ element, saveStatus, onSave, onPickFile }: ImageSectionP
         <div className="flex gap-2 mb-2">
           <div className="flex-1">
             <p className="text-[10px] text-gray-600 mb-1">Width</p>
-            <input
-              type="text"
-              value={draftWidth}
-              placeholder="auto"
+            <input type="text" value={draftWidth} placeholder="auto"
               onChange={(e) => setDraftWidth(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 focus:border-blue-500 focus:outline-none rounded px-2 py-1.5 text-[11px] text-gray-200 font-mono transition-colors"
-            />
+              className="w-full bg-gray-800 border border-gray-700 focus:border-blue-500 focus:outline-none rounded px-2 py-1.5 text-[11px] text-gray-200 font-mono transition-colors" />
           </div>
           <div className="flex-1">
             <p className="text-[10px] text-gray-600 mb-1">Height</p>
-            <input
-              type="text"
-              value={draftHeight}
-              placeholder="auto"
+            <input type="text" value={draftHeight} placeholder="auto"
               onChange={(e) => setDraftHeight(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 focus:border-blue-500 focus:outline-none rounded px-2 py-1.5 text-[11px] text-gray-200 font-mono transition-colors"
-            />
+              className="w-full bg-gray-800 border border-gray-700 focus:border-blue-500 focus:outline-none rounded px-2 py-1.5 text-[11px] text-gray-200 font-mono transition-colors" />
           </div>
         </div>
       )}
 
-      {/* Object-fit */}
+      {/* Object Fit — 4 toggle buttons */}
       <div className="mb-2">
-        <p className="text-[10px] text-gray-600 mb-1">Object fit</p>
-        <select
-          value={draftObjectFit}
-          onChange={(e) => setDraftObjectFit(e.target.value)}
-          className="w-full bg-gray-800 border border-gray-700 focus:border-blue-500 focus:outline-none rounded px-2 py-1.5 text-[11px] text-gray-200 transition-colors"
-        >
-          {OBJECT_FIT_OPTIONS.map((opt) => (
-            <option key={opt} value={opt}>{opt || '— default —'}</option>
+        <p className="text-[10px] text-gray-600 mb-1">Object Fit</p>
+        <div className="grid grid-cols-4 gap-1">
+          {FIT_OPTIONS.map((opt) => (
+            <button
+              key={opt}
+              onClick={() => patchFit(opt)}
+              className={`py-1 text-[10px] rounded border capitalize transition-colors ${
+                draftFit === opt
+                  ? 'bg-blue-600 border-blue-500 text-white'
+                  : 'bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-600 hover:text-gray-200'
+              }`}
+            >
+              {opt}
+            </button>
           ))}
-        </select>
+        </div>
       </div>
 
-      {/* Save / Cancel */}
-      <div className="flex items-center gap-2 mt-1">
+      {/* Position — 3×3 grid */}
+      <div className="mb-2">
+        <p className="text-[10px] text-gray-600 mb-1">Position</p>
+        <div className="inline-grid grid-cols-3 gap-0.5">
+          {GRID_ANCHORS.map(({ x, y, label }) => {
+            const active = draftFX === x && draftFY === y
+            return (
+              <button
+                key={label}
+                title={label}
+                onClick={() => patchFocal(x, y)}
+                className={`w-[22px] h-[22px] flex items-center justify-center rounded border transition-colors ${
+                  active
+                    ? 'bg-blue-600 border-blue-500'
+                    : 'bg-gray-800 border-gray-700 hover:bg-gray-700'
+                }`}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${active ? 'bg-white' : 'bg-gray-500'}`} />
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* Zoom slider */}
+      <div className="mb-3">
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-[10px] text-gray-600">Zoom</p>
+          <span className="text-[10px] text-gray-400 font-mono">{draftZoom}%</span>
+        </div>
+        <input
+          type="range"
+          min={25}
+          max={300}
+          value={draftZoom}
+          onChange={(e) => patchZoom(parseInt(e.target.value, 10))}
+          className="w-full accent-blue-500 cursor-pointer"
+        />
+        <div className="flex justify-between text-[9px] text-gray-700 mt-0.5">
+          <span>25%</span><span>300%</span>
+        </div>
+      </div>
+
+      {/* Reset / Save / Cancel */}
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={handleReset}
+          title="Reset to Cover / Center / 100%"
+          className="px-2 py-1.5 text-gray-500 hover:text-gray-300 text-xs rounded border border-gray-800 hover:border-gray-700 transition-colors"
+        >
+          Reset
+        </button>
         <button
           onClick={handleSave}
           disabled={!hasChanges || saveStatus === 'saving'}
@@ -278,7 +530,7 @@ function ImageSection({ element, saveStatus, onSave, onPickFile }: ImageSectionP
         <button
           onClick={handleCancel}
           disabled={!hasChanges}
-          className="px-3 py-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed text-xs rounded border border-gray-800 hover:border-gray-700 transition-colors"
+          className="px-2 py-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed text-xs rounded border border-gray-800 hover:border-gray-700 transition-colors"
         >
           Cancel
         </button>
@@ -524,6 +776,7 @@ interface InspectorPanelProps {
   onClearSelection: () => void
   onInspectorSave: (patch: InspectorSavePatch) => void
   onPickFile: () => Promise<ImagePickResult | null>
+  onLivePatch: (patch: DomPatch) => void
 }
 
 export function InspectorPanel({
@@ -533,6 +786,7 @@ export function InspectorPanel({
   onClearSelection,
   onInspectorSave,
   onPickFile,
+  onLivePatch,
 }: InspectorPanelProps) {
   return (
     <div className="w-60 flex flex-col bg-gray-900 border-l border-gray-800 shrink-0 overflow-hidden">
@@ -592,6 +846,7 @@ export function InspectorPanel({
                   saveStatus={saveStatus}
                   onSave={onInspectorSave}
                   onPickFile={onPickFile}
+                  onLivePatch={onLivePatch}
                 />
               )
             }

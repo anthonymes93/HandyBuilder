@@ -69,7 +69,11 @@ function collectData(el: HTMLElement) {
       paddingBottom: cs.paddingBottom, paddingLeft: cs.paddingLeft,
       fontSize: cs.fontSize, color: cs.color, backgroundColor: cs.backgroundColor,
       objectFit: cs.objectFit,
+      objectPosition: cs.objectPosition,
       backgroundImage: cs.backgroundImage,
+      backgroundSize: cs.backgroundSize,
+      backgroundPosition: cs.backgroundPosition,
+      transform: cs.transform,
     },
     href:      'href'      in el ? (a.getAttribute('href') ?? null) : null,
     inputType: 'type'      in el ? (inp.type || null) : null,
@@ -85,6 +89,8 @@ function collectData(el: HTMLElement) {
     hbSourceLine:    sourceLine    ?? null,
     hbSourceCol:     sourceCol     ?? null,
     hbComponentName: componentName ?? null,
+    // Per-item identifier for mapped array elements (set via data-hb-item-id attribute)
+    hbItemId: el.getAttribute('data-hb-item-id') ?? null,
   }
 }
 
@@ -513,7 +519,11 @@ interface DomPatch {
   imageWidth?: string
   imageHeight?: string
   objectFit?: string
+  objectPosition?: string
   backgroundImage?: string
+  backgroundSize?: string
+  backgroundPosition?: string
+  transform?: string
 }
 
 function applyDomPatch(patch: DomPatch): void {
@@ -537,11 +547,46 @@ function applyDomPatch(patch: DomPatch): void {
     if (/^\d+$/.test(h)) img.height = parseInt(h, 10)
     else el.style.height = h
   }
-  if (patch.objectFit       !== undefined) el.style.objectFit       = patch.objectFit
-  if (patch.backgroundImage !== undefined) el.style.backgroundImage = patch.backgroundImage
+  if (patch.objectFit        !== undefined) el.style.objectFit        = patch.objectFit
+  if (patch.objectPosition   !== undefined) el.style.objectPosition   = patch.objectPosition
+  if (patch.backgroundImage  !== undefined) el.style.backgroundImage  = patch.backgroundImage
+  if (patch.backgroundSize   !== undefined) el.style.backgroundSize   = patch.backgroundSize
+  if (patch.backgroundPosition !== undefined) el.style.backgroundPosition = patch.backgroundPosition
+  if (patch.transform        !== undefined) el.style.transform        = patch.transform
 
   log(`applyDomPatch applied to <${el.tagName.toLowerCase()}>`)
   ipcRenderer.sendToHost('inspector:selected', collectData(el))
+}
+
+// ─── SPA route detection ──────────────────────────────────────────────────────
+
+function onRouteChange(): void {
+  log(`route changed → ${window.location.pathname}`)
+  if (editState.active) cancelEdit()
+  clearHover()
+  clearSelected()
+  ipcRenderer.sendToHost('inspector:route-changed', {
+    pathname: window.location.pathname,
+    href:     window.location.href,
+  })
+}
+
+function patchHistory(): void {
+  const origPush    = history.pushState.bind(history) as typeof history.pushState
+  const origReplace = history.replaceState.bind(history) as typeof history.replaceState
+
+  history.pushState = function (data, unused, url) {
+    origPush(data, unused, url)
+    onRouteChange()
+  }
+  history.replaceState = function (data, unused, url) {
+    origReplace(data, unused, url)
+    onRouteChange()
+  }
+
+  window.addEventListener('popstate',   onRouteChange)
+  window.addEventListener('hashchange', onRouteChange)
+  log('history patched for SPA route detection')
 }
 
 // ─── IPC setup ────────────────────────────────────────────────────────────────
@@ -552,6 +597,7 @@ function setup(): void {
   ipcRenderer.on('inspector:disable', () => { log('IPC → inspector:disable'); disable() })
   ipcRenderer.on('inspector:clear',   () => { clearHover(); clearSelected() })
   ipcRenderer.on('editor:apply-dom-patch', (_e, patch: DomPatch) => applyDomPatch(patch))
+  patchHistory()
 }
 
 if (document.readyState === 'loading') {

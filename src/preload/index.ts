@@ -71,6 +71,22 @@ const api = {
   readProjectFile: (params: { filePath: string; projectPath: string }) =>
     ipcRenderer.invoke('editor:read-file', params),
 
+  /** Write or merge a JSX inline style prop using source file + line metadata. */
+  writeInlineStyle: (params: {
+    filePath: string
+    lineNumber: number
+    styleProps: Record<string, string>
+    tagName?: string
+  }) => ipcRenderer.invoke('editor:write-inline-style', params),
+
+  /** Update a single property on an array item identified by a unique string value. */
+  writeArrayItemProp: (params: {
+    filePath: string
+    itemId: string
+    propName: string
+    propValue: string
+  }) => ipcRenderer.invoke('editor:write-array-item-prop', params),
+
   /** Open a file in the system default editor (e.g. VS Code). */
   openFileInEditor: (filePath: string) => ipcRenderer.invoke('editor:open-file', filePath),
 

@@ -1,5 +1,5 @@
 import { ipcMain, shell, dialog, BrowserWindow, IpcMainInvokeEvent } from 'electron'
-import { join, relative, sep } from 'path'
+import { join, relative, sep, extname, basename } from 'path'
 import * as fs from 'fs'
 import { getDialogParent } from '../dialogParent'
 import { ProjectManager } from '../project/manager'
@@ -12,6 +12,7 @@ import {
   LocatedEditParams,
   CommitParams
 } from '../editor/fileEditor'
+import { writeInlineStyle, WriteInlineStyleParams, writeArrayItemProp, WriteArrayItemPropParams } from '../editor/styleWriter'
 import {
   getMapping,
   saveMapping,
@@ -92,6 +93,16 @@ export function setupIpcHandlers(
     commitTextEdit(params)
   )
 
+  // Write or merge a JSX inline style={{ ... }} prop using source metadata.
+  ipcMain.handle('editor:write-inline-style', (_e: IpcMainInvokeEvent, params: WriteInlineStyleParams) =>
+    writeInlineStyle(params)
+  )
+
+  // Update a single property on a specific array item identified by a unique string value.
+  ipcMain.handle('editor:write-array-item-prop', (_e: IpcMainInvokeEvent, params: WriteArrayItemPropParams) =>
+    writeArrayItemProp(params)
+  )
+
   // Open a file in the system default editor (e.g. VS Code).
   ipcMain.handle('editor:open-file', async (_e: IpcMainInvokeEvent, filePath: string) => {
     const err = await shell.openPath(filePath)
@@ -148,40 +159,34 @@ export function setupIpcHandlers(
     }
   })
 
-  // Open a file-picker dialog for images; returns a project-relative URL or null.
+  // Open a file-picker dialog for images anywhere on disk, copy into
+  // public/handybuilder-assets/, and return the browser-usable URL.
   ipcMain.handle('image:pick-file', async () => {
     const project = projectManager.getProject()
     if (!project) return null
 
-    const projectPath = project.path
-
     const dialogParent = getDialogParent(mainWindow)
     const result = await dialog.showOpenDialog(dialogParent, {
       title: 'Choose Image',
-      defaultPath: projectPath,
       properties: ['openFile'],
       filters: [
-        { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'avif', 'ico'] }
+        { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }
       ]
     })
 
     if (result.canceled || !result.filePaths[0]) return null
 
-    const abs = result.filePaths[0]
+    const sourcePath = result.filePaths[0]
+    const ext        = extname(sourcePath).toLowerCase()
+    const base       = basename(sourcePath, ext).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40)
+    const destName   = `${base}-${Date.now()}${ext}`
 
-    // Enforce: file must be inside the project folder
-    if (!abs.startsWith(projectPath + sep)) {
-      return { error: 'Selected file must be inside the project folder' }
-    }
+    const assetsDir = join(project.path, 'public', 'handybuilder-assets')
+    fs.mkdirSync(assetsDir, { recursive: true })
+    fs.copyFileSync(sourcePath, join(assetsDir, destName))
 
-    const rel = relative(projectPath, abs).replace(/\\/g, '/')
-
-    // Files under public/ are served at / by Vite dev servers
-    if (rel.startsWith('public/')) {
-      return { url: '/' + rel.slice('public/'.length), relativePath: rel }
-    }
-
-    // Anything else: serve relative to project root
-    return { url: '/' + rel, relativePath: rel }
+    const relativePath = `public/handybuilder-assets/${destName}`
+    const url          = `/handybuilder-assets/${destName}`
+    return { url, relativePath }
   })
 }

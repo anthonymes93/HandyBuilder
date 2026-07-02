@@ -25,6 +25,8 @@ export interface UseTextEditReturn {
   handleManualCommit: (match: SourceMatch, newText: string) => Promise<CommitResult>
   retryLastSave: () => Promise<void>
   dismissSaveResult: () => void
+  /** Directly drive the save badge from outside the hook (e.g. for writeInlineStyle). */
+  reportDirectWrite: (result: { success: boolean; filePath?: string; lineNumber?: number; error?: string }) => void
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -432,6 +434,26 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
     setSaveResult(IDLE)
   }, [])
 
+  // ── direct write result (writeInlineStyle path) ───────────────────────────
+
+  const reportDirectWrite = useCallback((
+    result: { success: boolean; filePath?: string; lineNumber?: number; error?: string }
+  ): void => {
+    if (clearTimerRef.current) clearTimeout(clearTimerRef.current)
+    if (result.success && result.filePath) {
+      setSaveResult({
+        status:       'saved',
+        filePath:     result.filePath,
+        relativePath: toRelative(result.filePath, project?.path),
+        lineNumber:   result.lineNumber,
+      })
+      scheduleClear(10_000)
+    } else {
+      setSaveResult({ status: 'failed', error: result.error ?? 'Style write failed' })
+      scheduleClear(30_000)
+    }
+  }, [project])
+
   return {
     saveStatus,
     saveResult,
@@ -442,5 +464,6 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
     handleManualCommit,
     retryLastSave,
     dismissSaveResult,
+    reportDirectWrite,
   }
 }

@@ -3,7 +3,7 @@ import { useProject } from './hooks/useProject'
 import { useDevServer } from './hooks/useDevServer'
 import { useTextEdit, buildElementKey } from './hooks/useTextEdit'
 import { AppLayout } from './components/Layout/AppLayout'
-import { SelectedElement, InspectorSavePatch, ImagePickResult, TextEditPayload, SourceMatch } from './types'
+import { SelectedElement, InspectorSavePatch, ImagePickResult, TextEditPayload, SourceMatch, DomPatch } from './types'
 import type { PreviewFrameHandle } from './components/Preview/PreviewPanel'
 import type { HbInjectionDiagnostic } from './components/Preview/PreviewPanel'
 
@@ -33,6 +33,7 @@ function App() {
     handleManualCommit,
     retryLastSave,
     dismissSaveResult,
+    reportDirectWrite,
   } = useTextEdit(project)
 
   const [isInspectMode, setIsInspectMode] = useState(false)
@@ -154,23 +155,120 @@ function App() {
     [handleManualCommit, project, locatorPayload]
   )
 
+  // ── live DOM patch (no source save) ─────────────────────────────────────────
+
+  const handleLivePatch = useCallback((patch: DomPatch) => {
+    previewRef.current?.applyDomPatch(patch)
+  }, [])
+
   // ── inspector save ──────────────────────────────────────────────────────────
 
   const handleInspectorSave = useCallback(
     async (patch: InspectorSavePatch) => {
       const el = patch.element
 
+      // Apply changes to the live preview DOM immediately.
       previewRef.current?.applyDomPatch({
-        text:            patch.text,
-        href:            patch.href,
-        disabled:        patch.disabled,
-        imageSrc:        patch.imageSrc,
-        imageAlt:        patch.imageAlt,
-        imageWidth:      patch.imageWidth,
-        imageHeight:     patch.imageHeight,
-        objectFit:       patch.objectFit,
-        backgroundImage: patch.backgroundImage,
+        text:               patch.text,
+        href:               patch.href,
+        disabled:           patch.disabled,
+        imageSrc:           patch.imageSrc,
+        imageAlt:           patch.imageAlt,
+        imageWidth:         patch.imageWidth,
+        imageHeight:        patch.imageHeight,
+        objectFit:          patch.objectFit,
+        objectPosition:     patch.objectPosition,
+        backgroundImage:    patch.backgroundImage,
+        backgroundSize:     patch.backgroundSize,
+        backgroundPosition: patch.backgroundPosition,
+        transform:          patch.transform,
       })
+
+      // ── Image display-style save (new path) ────────────────────────────────
+      // When source metadata is available, write a real inline style={{ }} prop
+      // rather than using the fuzzy text-search pipeline.
+
+      const hasStyleProps =
+        patch.objectFit          !== undefined ||
+        patch.objectPosition     !== undefined ||
+        patch.transform          !== undefined ||
+        patch.backgroundSize     !== undefined ||
+        patch.backgroundPosition !== undefined ||
+        patch.backgroundImage    !== undefined
+
+      if (hasStyleProps && el.hbSourceFile && el.hbSourceLine) {
+        const styleProps: Record<string, string> = {}
+
+        if (el.tagName === 'img') {
+          if (patch.objectFit      !== undefined) styleProps.objectFit      = patch.objectFit
+          if (patch.objectPosition !== undefined) styleProps.objectPosition = patch.objectPosition
+          // 'none' means "no zoom" — writeInlineStyle deletes the key when value is ''
+          if (patch.transform !== undefined) {
+            styleProps.transform = patch.transform === 'none' ? '' : patch.transform
+          }
+        } else {
+          // Background element
+          if (el.hbItemId && patch.backgroundImage !== undefined) {
+            // Per-item image inside a mapped array — write to the data array item,
+            // not the shared JSX style prop (which would change all mapped cards).
+            const m = patch.backgroundImage.match(/url\(["']?([^"')]+)["']?\)/)
+            if (m) {
+              console.log('[app] writeArrayItemProp →', el.hbSourceFile, 'item', el.hbItemId, 'image:', m[1])
+              const result = await window.api.writeArrayItemProp({
+                filePath:  el.hbSourceFile,
+                itemId:    el.hbItemId,
+                propName:  'image',
+                propValue: m[1],
+              })
+              reportDirectWrite(result)
+            }
+            // Skip writeInlineStyle — backgroundSize/backgroundPosition are sensible
+            // defaults in the JSX template; writing them would affect all cards equally.
+            return
+          }
+          if (patch.backgroundImage !== undefined) {
+            const m = patch.backgroundImage.match(/url\(["']?([^"')]+)["']?\)/)
+            if (m) styleProps.backgroundImage = `url("${m[1]}")`
+          }
+          if (patch.backgroundSize     !== undefined) styleProps.backgroundSize     = patch.backgroundSize
+          if (patch.backgroundPosition !== undefined) styleProps.backgroundPosition = patch.backgroundPosition
+          styleProps.backgroundRepeat = 'no-repeat'
+        }
+
+        if (Object.keys(styleProps).length > 0) {
+          console.log('[app] writeInlineStyle →', el.hbSourceFile, 'line', el.hbSourceLine, styleProps)
+          const result = await window.api.writeInlineStyle({
+            filePath:   el.hbSourceFile,
+            lineNumber: el.hbSourceLine,
+            styleProps,
+            tagName:    el.tagName,
+          })
+          reportDirectWrite(result)
+        }
+
+        // Attribute-level saves for img (src, alt, width, height) still go
+        // through the text-search pipeline when there's no dedicated IPC for them.
+        if (el.tagName === 'img') {
+          type SavePair = { oldText: string; newText: string }
+          const saves: SavePair[] = []
+          function pushAttr(old: string | null | undefined, next: string | undefined) {
+            if (next === undefined) return
+            const o = (old ?? '').trim()
+            const n = next.trim()
+            if (n && n !== o) saves.push({ oldText: o, newText: n })
+          }
+          pushAttr(el.imageSrc, patch.imageSrc)
+          pushAttr(el.imageAlt, patch.imageAlt)
+          for (const { oldText, newText } of saves) {
+            if (!oldText || !newText) continue
+            await handleTextSaved({ tagName: el.tagName, oldText, newText })
+          }
+        }
+
+        return
+      }
+
+      // ── Text / link / button / fallback saves (existing text-search path) ──
 
       type SavePair = { oldText: string; newText: string }
       const saves: SavePair[] = []
@@ -182,13 +280,17 @@ function App() {
         if (n && n !== o) saves.push({ oldText: o, newText: n })
       }
 
-      push(el.textContent,        patch.text)
-      push(el.href,               patch.href)
-      push(el.imageSrc,           patch.imageSrc)
-      push(el.imageAlt,           patch.imageAlt)
-      push(el.imageWidth,         patch.imageWidth)
-      push(el.imageHeight,        patch.imageHeight)
-      push(el.computed.objectFit, patch.objectFit)
+      push(el.textContent, patch.text)
+      push(el.href,        patch.href)
+      push(el.imageSrc,    patch.imageSrc)
+      push(el.imageAlt,    patch.imageAlt)
+      push(el.imageWidth,  patch.imageWidth)
+      push(el.imageHeight, patch.imageHeight)
+      // Fallback style saves (no source metadata)
+      push(el.computed.objectFit,          patch.objectFit)
+      push(el.computed.objectPosition,     patch.objectPosition)
+      push(el.computed.backgroundSize,     patch.backgroundSize)
+      push(el.computed.backgroundPosition, patch.backgroundPosition)
       if (patch.backgroundImage !== undefined) {
         const extractUrl = (v: string) => { const m = v.match(/url\(["']?([^"')]+)["']?\)/); return m ? m[1] : v }
         push(extractUrl(el.computed.backgroundImage ?? ''), extractUrl(patch.backgroundImage))
@@ -200,7 +302,7 @@ function App() {
         if (result === 'needs-confirmation') return
       }
     },
-    [handleTextSaved]
+    [handleTextSaved, reportDirectWrite]
   )
 
   return (
@@ -235,6 +337,7 @@ function App() {
       onCancelConfirmation={handleCancelConfirmation}
       onInspectorSave={handleInspectorSave}
       onPickFile={handlePickFile}
+      onLivePatch={handleLivePatch}
       onRetryLastSave={retryLastSave}
       onOpenSourceLocator={handleOpenSourceLocator}
       onCloseSourceLocator={handleCloseSourceLocator}

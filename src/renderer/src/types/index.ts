@@ -35,7 +35,11 @@ export interface ComputedStyles {
   color: string
   backgroundColor: string
   objectFit: string
+  objectPosition: string
   backgroundImage: string
+  backgroundSize: string
+  backgroundPosition: string
+  transform: string
 }
 
 export interface SelectedElement {
@@ -61,6 +65,8 @@ export interface SelectedElement {
   hbSourceLine?:    number | null
   hbSourceCol?:     number | null
   hbComponentName?: string | null
+  // Per-item identifier for elements inside .map() (from data-hb-item-id attribute)
+  hbItemId?: string | null
 }
 
 /** Typed interface for Electron's <webview> element used in PreviewPanel. */
@@ -198,7 +204,11 @@ export interface DomPatch {
   imageWidth?: string
   imageHeight?: string
   objectFit?: string
+  objectPosition?: string
   backgroundImage?: string
+  backgroundSize?: string
+  backgroundPosition?: string
+  transform?: string
 }
 
 /** What the Inspector form submits when the user clicks Save. */
@@ -214,7 +224,11 @@ export interface InspectorSavePatch {
   imageWidth?: string
   imageHeight?: string
   objectFit?: string
+  objectPosition?: string
   backgroundImage?: string
+  backgroundSize?: string
+  backgroundPosition?: string
+  transform?: string
 }
 
 /** Returned by the image file-picker IPC call. */

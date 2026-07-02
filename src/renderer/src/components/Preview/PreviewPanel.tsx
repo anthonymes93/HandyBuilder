@@ -132,9 +132,15 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
           void Promise.resolve(onTextSaved(e.args[0] as TextEditPayload)).catch(
             (err: unknown) => console.error('[preview] onTextSaved rejected:', err)
           )
+        } else if (e.channel === 'inspector:route-changed') {
+          console.log('[preview] SPA route changed', e.args[0])
+          onPageNavigated()
+          if (isInspectModeRef.current) {
+            setTimeout(() => { webviewRef.current?.send('inspector:enable') }, 50)
+          }
         }
       },
-      [onElementSelected, onTextSaved]
+      [onElementSelected, onTextSaved, onPageNavigated]
     )
 
     // ── attach webview event listeners ─────────────────────────────────────
@@ -158,13 +164,33 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
         onPageNavigated()
       }
 
+      function onDidNavigate() {
+        console.log('[preview] did-navigate — full navigation')
+        isReadyRef.current = false
+      }
+
+      function onDidNavigateInPage() {
+        console.log('[preview] did-navigate-in-page — SPA navigation')
+        // Bridge sends inspector:route-changed for the same event; this is a
+        // safety net in case the bridge message is delayed or dropped.
+        isReadyRef.current = true
+        onPageNavigated()
+        if (isInspectModeRef.current) {
+          setTimeout(() => { webview!.send('inspector:enable') }, 50)
+        }
+      }
+
       webview.addEventListener('dom-ready', onDomReady)
       webview.addEventListener('did-start-loading', onStartLoading)
+      webview.addEventListener('did-navigate', onDidNavigate)
+      webview.addEventListener('did-navigate-in-page', onDidNavigateInPage)
       webview.addEventListener('ipc-message', onIpcMessage)
 
       return () => {
         webview.removeEventListener('dom-ready', onDomReady)
         webview.removeEventListener('did-start-loading', onStartLoading)
+        webview.removeEventListener('did-navigate', onDidNavigate)
+        webview.removeEventListener('did-navigate-in-page', onDidNavigateInPage)
         webview.removeEventListener('ipc-message', onIpcMessage)
       }
     }, [onIpcMessage, onPageNavigated, url, bridgePath]) // ← url + bridgePath are the critical additions

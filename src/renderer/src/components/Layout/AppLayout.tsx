@@ -2,7 +2,7 @@ import type { RefObject } from 'react'
 import {
   Project, FileNode, DevServerStatus, SelectedElement,
   TextEditPayload, TextEditAnalysis, SourceMatch, SaveStatus,
-  InspectorSavePatch, ImagePickResult, SaveResult, CommitResult
+  InspectorSavePatch, ImagePickResult, SaveResult, CommitResult, DomPatch
 } from '../../types'
 import { Toolbar } from '../Toolbar/Toolbar'
 import { LeftSidebar } from '../LeftSidebar/LeftSidebar'
@@ -45,6 +45,7 @@ interface AppLayoutProps {
   onCancelConfirmation: () => void
   onInspectorSave: (patch: InspectorSavePatch) => void
   onPickFile: () => Promise<ImagePickResult | null>
+  onLivePatch: (patch: DomPatch) => void
   onRetryLastSave: () => void
   onOpenSourceLocator: (payload: TextEditPayload) => void
   onCloseSourceLocator: () => void
@@ -85,6 +86,7 @@ export function AppLayout({
   onCancelConfirmation,
   onInspectorSave,
   onPickFile,
+  onLivePatch,
   onRetryLastSave,
   onOpenSourceLocator,
   onCloseSourceLocator,
@@ -132,6 +134,7 @@ export function AppLayout({
         onClearSelection={onClearSelection}
         onInspectorSave={onInspectorSave}
         onPickFile={onPickFile}
+        onLivePatch={onLivePatch}
       />
     )
   }
