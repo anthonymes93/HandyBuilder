@@ -130,8 +130,12 @@ function collectData(el: HTMLElement, resolvedFrom?: string | null) {
     hbItemId: el.getAttribute('data-hb-item-id') ?? null,
     // Set when the clicked element was resolved up to a closer ancestor (e.g. div → a)
     resolvedFrom: resolvedFrom ?? null,
-    // Stable per-element style class, once a hover style has been saved for this element.
-    hbStyleId: Array.from(el.classList).find((c) => /^hb-style-[a-z0-9]+$/.test(c))?.replace('hb-style-', '') ?? null,
+    // Stable per-element style class, once a style has been saved for this element
+    // (hb-style-* for shared-component/direct edits, hb-instance-* for per-instance edits).
+    hbStyleId: Array.from(el.classList).find((c) => /^hb-(style|instance)-[a-z0-9]+$/.test(c))?.replace(/^hb-(style|instance)-/, '') ?? null,
+    // Current route — folded into the style-identity hash so mapped/repeated
+    // instances on different routes never collide.
+    pathname: window.location.pathname,
   }
 }
 

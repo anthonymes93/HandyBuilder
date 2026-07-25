@@ -121,6 +121,8 @@ export interface HandyBuilderAPI {
     textContent?: string | null
     href?: string | null
     classList?: string[]
+    pathname?: string | null
+    itemId?: string | null
     normalStyleProps: Record<string, string>
     hoverStyleProps?: Record<string, string>
     projectPath: string
@@ -133,6 +135,7 @@ export interface HandyBuilderAPI {
     hoverPersisted?: boolean
     hoverWarning?: string
     styleId?: string
+    appliedClassName?: string
     sharedComponentWarning?: string
     needsScopeChoice?: {
       componentName: string

@@ -158,6 +158,8 @@ const api = {
     textContent?: string | null
     href?: string | null
     classList?: string[]
+    pathname?: string | null
+    itemId?: string | null
     normalStyleProps: Record<string, string>
     hoverStyleProps?: Record<string, string>
     projectPath: string

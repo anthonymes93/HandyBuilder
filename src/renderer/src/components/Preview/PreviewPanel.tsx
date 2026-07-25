@@ -10,6 +10,8 @@ export interface PreviewFrameHandle {
   clearInspector: () => void
   applyDomPatch: (patch: DomPatch) => void
   checkHbInjection: () => Promise<HbInjectionDiagnostic>
+  /** Count elements in the live preview matching a CSS selector — used to verify a style edit stayed isolated to one element. */
+  countMatchingElements: (selector: string) => Promise<number>
 }
 
 export interface HbMetadataElement {
@@ -104,6 +106,17 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
           }
           return result;
         })()`)
+      },
+      async countMatchingElements(selector: string) {
+        const webview = webviewRef.current
+        if (!webview || !isReadyRef.current) return -1
+        try {
+          return await webview.executeJavaScript<number>(
+            `document.querySelectorAll(${JSON.stringify(selector)}).length`
+          )
+        } catch {
+          return -1
+        }
       }
     }))
 

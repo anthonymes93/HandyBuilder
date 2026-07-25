@@ -216,6 +216,22 @@ function App() {
     previewRef.current?.applyDomPatch(patch)
   }, [])
 
+  // Poll the live preview for how many elements carry a just-written style
+  // class. Stops as soon as at least one match appears (HMR lands as one
+  // atomic re-render, so the first non-zero reading is the final one) or
+  // after ~3s if the preview never picks up the change.
+  const waitForClassCount = useCallback(async (className: string): Promise<number> => {
+    const selector = `.${className}`
+    const deadline = Date.now() + 3000
+    let last = 0
+    while (Date.now() < deadline) {
+      last = (await previewRef.current?.countMatchingElements(selector)) ?? -1
+      if (last > 0) return last
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+    return last
+  }, [])
+
   // ── inspector save ──────────────────────────────────────────────────────────
 
   const handleInspectorSave = useCallback(
@@ -259,6 +275,8 @@ function App() {
           textContent: el.textContent ?? undefined,
           href: el.href ?? undefined,
           classList: el.classList,
+          pathname: el.pathname ?? undefined,
+          itemId: el.hbItemId ?? undefined,
           normalStyleProps: (patch.styleNormal ?? {}) as Record<string, string>,
           hoverStyleProps: patch.styleHover as Record<string, string> | undefined,
           projectPath,
@@ -271,7 +289,15 @@ function App() {
 
         if (result.needsScopeChoice) {
           console.log('[app] writeElementStyle → needs scope choice', result.needsScopeChoice)
-          setPendingScopeChoice({ patch, choice: result.needsScopeChoice })
+          setPendingScopeChoice({
+            patch,
+            choice: {
+              ...result.needsScopeChoice,
+              identityText: el.textContent,
+              identityHref: el.href,
+              identityItemId: el.hbItemId,
+            },
+          })
           return
         }
 
@@ -287,6 +313,27 @@ function App() {
             error: top ? `${result.error} — top candidates: ${top}` : result.error,
           })
           return
+        }
+
+        // ── Post-save isolation check ────────────────────────────────────────
+        // "This button only" must change exactly one element. Poll the live
+        // preview for the class we just wrote; if it landed on more than one
+        // DOM node, the edit wasn't actually isolated — roll the whole
+        // transaction back rather than leave a mis-scoped style in place.
+        if (result.success && patch.styleEditScope === 'instance' && result.appliedClassName) {
+          const count = await waitForClassCount(result.appliedClassName)
+          if (count > 1) {
+            console.warn('[app] instance style was not isolated — rolling back. matches:', count)
+            await undoHistory()
+            reportDirectWrite({
+              success: false,
+              error: 'Instance style was not isolated; changes were rolled back.',
+            })
+            return
+          }
+          if (count === 0) {
+            console.warn('[app] instance style isolation check inconclusive (no matches yet) — showing Saved')
+          }
         }
 
         reportDirectWrite(
@@ -522,7 +569,7 @@ function App() {
         if (result === 'needs-confirmation') return
       }
     },
-    [handleTextSaved, reportDirectWrite, project]
+    [handleTextSaved, reportDirectWrite, project, waitForClassCount, undoHistory]
   )
 
   // ── style-editor scope choice ("this button only" vs "all buttons using X") ─

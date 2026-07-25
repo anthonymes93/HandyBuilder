@@ -4,11 +4,10 @@
  *
  * Inline `style={{}}` can express the NORMAL state but not `:hover` — CSS
  * needs a real selector for that. So the first time an element gets a hover
- * style, we (1) give it a stable, deterministic class (`hb-style-<id>`, hashed
- * from its source file+line so the same element always gets the same class
- * across saves/reopens — no separate id-mapping store needed), (2) write/merge
- * a `.hb-style-<id>:hover { ... }` rule into a shared stylesheet, and (3)
- * make sure the component file imports that stylesheet once.
+ * style, we (1) give it a stable, deterministic class hashed from its full
+ * identity (2) write/merge a `.<class>:hover { ... }` rule into a shared
+ * stylesheet, and (3) make sure the component file imports that stylesheet
+ * once.
  */
 import * as fs from 'fs'
 import * as path from 'path'
@@ -21,9 +20,33 @@ function toKebabCase(prop: string): string {
   return prop.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)
 }
 
-/** Deterministic short id from a source location — same element, same id, every time. */
-export function computeStyleId(filePath: string, sourceLine: number): string {
-  const input = `${filePath}:${sourceLine}`
+/**
+ * Everything that makes one JSX invocation unique. file+line alone collapses
+ * to the SAME value for every item rendered from a `.map()` template — the
+ * whole reason "this button only" used to affect every item — so itemId
+ * (and pathname/text/href as extra disambiguators) must be folded in too.
+ */
+export interface StyleIdentity {
+  file: string
+  line: number
+  column?: number | null
+  pathname?: string | null
+  itemId?: string | null
+  text?: string | null
+  href?: string | null
+}
+
+/** Deterministic short id from a full identity — same element, same id, every time. */
+export function computeStyleId(identity: StyleIdentity): string {
+  const input = [
+    identity.file,
+    identity.line,
+    identity.column ?? '',
+    identity.pathname ?? '',
+    identity.itemId ?? '',
+    identity.text ?? '',
+    identity.href ?? '',
+  ].join('|')
   let hash = 5381
   for (let i = 0; i < input.length; i++) {
     hash = ((hash << 5) + hash + input.charCodeAt(i)) >>> 0
@@ -46,35 +69,68 @@ export function stylesheetImportSpecifier(componentFilePath: string, stylesheetA
 }
 
 /**
- * Read the stylesheet (missing file → empty string, never throws) and return
- * new content with the `.hb-style-<id>:hover { ... }` rule upserted. Passing
- * an empty `hoverProps` removes the rule (used when the user clears all hover
- * values). Returns a no-op MutateOutcome if nothing actually changes.
+ * Upsert ONE CSS rule for an exact single-class selector (never anything
+ * broader like `a:hover` or `.button:hover`). Passing empty `props` removes
+ * the rule if present. Returns whether anything actually changed.
  */
-export function computeHoverStylesheetMutation(
-  content: string,
-  styleId: string,
-  hoverProps: Record<string, string>
-): MutateOutcome {
-  const selector = `.hb-style-${styleId}:hover`
+function upsertRule(content: string, selector: string, props: Record<string, string>): { content: string; changed: boolean } {
   const blockPattern = new RegExp(`${selector.replace(/[.:]/g, '\\$&')}\\s*\\{[^}]*\\}\\n?`, 'm')
-
-  const entries = Object.entries(hoverProps).filter(([, v]) => v !== '')
+  const entries = Object.entries(props).filter(([, v]) => v !== '')
 
   if (entries.length === 0) {
-    if (!blockPattern.test(content)) return { success: true } // nothing to remove — no-op
-    return { success: true, newContent: content.replace(blockPattern, '').trimEnd() + '\n' }
+    if (!blockPattern.test(content)) return { content, changed: false }
+    return { content: content.replace(blockPattern, '').trimEnd() + '\n', changed: true }
   }
 
   const body = entries.map(([k, v]) => `  ${toKebabCase(k)}: ${v};`).join('\n')
   const rule = `${selector} {\n${body}\n}\n`
 
   if (blockPattern.test(content)) {
-    return { success: true, newContent: content.replace(blockPattern, rule) }
+    return { content: content.replace(blockPattern, rule), changed: true }
   }
-
   const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : ''
-  return { success: true, newContent: `${content}${separator}${rule}` }
+  return { content: `${content}${separator}${rule}`, changed: true }
+}
+
+/**
+ * Read the stylesheet (missing file → empty string, never throws) and return
+ * new content with `.<className> { ... }` (base) and/or `.<className>:hover
+ * { ... }` rules upserted. Either props map may be empty (nothing written/
+ * removed for that selector). Returns a no-op MutateOutcome if nothing
+ * actually changes.
+ *
+ * `className` must be the FULL class (e.g. "hb-instance-a31f2" for a
+ * per-instance edit, "hb-style-a31f2" for a shared/direct edit) — this
+ * function only ever writes single-class selectors, never anything broader.
+ */
+export function computeScopedStylesheetMutation(
+  content: string,
+  className: string,
+  baseProps: Record<string, string>,
+  hoverProps: Record<string, string>
+): MutateOutcome {
+  let current = content
+  let changed = false
+
+  const base = upsertRule(current, `.${className}`, baseProps)
+  current = base.content
+  changed = changed || base.changed
+
+  const hover = upsertRule(current, `.${className}:hover`, hoverProps)
+  current = hover.content
+  changed = changed || hover.changed
+
+  if (!changed) return { success: true }
+  return { success: true, newContent: current }
+}
+
+/** Convenience wrapper for the common hover-only case. */
+export function computeHoverStylesheetMutation(
+  content: string,
+  className: string,
+  hoverProps: Record<string, string>
+): MutateOutcome {
+  return computeScopedStylesheetMutation(content, className, {}, hoverProps)
 }
 
 /**

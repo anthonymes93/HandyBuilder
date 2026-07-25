@@ -172,9 +172,11 @@ export interface SelectedElement {
   hbItemId?: string | null
   // Set when a click was resolved up to a closer ancestor (e.g. 'div' means div → a)
   resolvedFrom?: string | null
-  // Stable per-element style class (hb-style-<id>), present once a hover style
-  // has been saved for this element at least once. Deterministic from source location.
+  // Stable per-element style class (hb-style-<id> or hb-instance-<id>), present
+  // once a style has been saved for this element at least once.
   hbStyleId?: string | null
+  /** Current route (window.location.pathname) — part of the style-identity hash. */
+  pathname?: string | null
 }
 
 /** Typed interface for Electron's <webview> element used in PreviewPanel. */
@@ -378,6 +380,10 @@ export interface StyleScopeChoice {
   sharedFilePath?: string
   sharedLine?: number
   sharedForwardsProps?: boolean
+  /** Display-only identity of the selected element, so the user can confirm it's the right one before choosing a scope. */
+  identityText?: string | null
+  identityHref?: string | null
+  identityItemId?: string | null
 }
 
 export interface StyleDiagnosticCandidate {

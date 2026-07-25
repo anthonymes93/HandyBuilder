@@ -50,6 +50,19 @@ export interface JsxCandidate {
   /** Byte offsets of the JSX opening tag itself (`<Tag ...>` / `<Tag .../>`). */
   tagStart: number
   tagEnd: number
+  /**
+   * True when this JSX node is inside a `.map()` callback — i.e. ONE source
+   * node renders MANY DOM elements at runtime. Writing an unconditional style
+   * or class here would affect every item, not just the one the user selected.
+   */
+  isMapped: boolean
+  /**
+   * Raw source text of the `data-hb-item-id={...}` expression found on this
+   * element or an ancestor within the same `.map()` callback (e.g. "item.id").
+   * Present only when isMapped is true and such an attribute could be found —
+   * this is what lets a per-instance edit be scoped with `item.id === "..."`.
+   */
+  mapItemExpr?: string
 }
 
 export interface LocateJsxResult {
@@ -121,6 +134,53 @@ function normalize(s: string): string {
   return s.replace(/\s+/g, ' ').trim().toLowerCase()
 }
 
+/**
+ * Walk up from a JSXOpeningElement to see whether it lives inside a
+ * `.map(item => ...)` callback — meaning this ONE source node is the template
+ * for MANY rendered DOM elements. Returns the callback function's path too,
+ * so callers can bound an ancestor search for a `data-hb-item-id` attribute
+ * to "within this same map callback" (not some unrelated outer map).
+ */
+function findMapContext(path: NodePath<t.JSXOpeningElement>): { isMapped: boolean; mapFuncPath?: NodePath } {
+  const funcParent = path.getFunctionParent()
+  if (!funcParent) return { isMapped: false }
+  const callPath = funcParent.parentPath
+  if (
+    callPath?.isCallExpression() &&
+    t.isMemberExpression(callPath.node.callee) &&
+    t.isIdentifier(callPath.node.callee.property) &&
+    callPath.node.callee.property.name === 'map'
+  ) {
+    return { isMapped: true, mapFuncPath: funcParent }
+  }
+  return { isMapped: false }
+}
+
+/**
+ * Find a `data-hb-item-id={expr}` attribute on this element or an ancestor
+ * JSX element, without leaving the bounding `.map()` callback. Returns the
+ * raw source text of `expr` (e.g. "item.id") — not a re-generated string —
+ * so it's guaranteed to compile identically to however the template already
+ * identifies each item.
+ */
+function findMapItemExpr(openingPath: NodePath<t.JSXOpeningElement>, mapFuncPath: NodePath, content: string): string | undefined {
+  let current: NodePath | null = openingPath
+  while (current) {
+    if (current.isJSXOpeningElement()) {
+      const attr = current.node.attributes.find(
+        (a): a is t.JSXAttribute => t.isJSXAttribute(a) && t.isJSXIdentifier(a.name, { name: 'data-hb-item-id' })
+      )
+      if (attr?.value && t.isJSXExpressionContainer(attr.value)) {
+        const expr = attr.value.expression
+        if (expr.start != null && expr.end != null) return content.slice(expr.start, expr.end)
+      }
+    }
+    if (current === mapFuncPath) break
+    current = current.parentPath
+  }
+  return undefined
+}
+
 interface RawCandidate {
   path: NodePath<t.JSXOpeningElement>
   opening: t.JSXOpeningElement
@@ -147,8 +207,12 @@ function collectAll(ast: t.File): RawCandidate[] {
   return out
 }
 
-function toCandidate(raw: RawCandidate, confidence: number): JsxCandidate {
+function toCandidate(raw: RawCandidate, confidence: number, content: string): JsxCandidate {
   const parentElement = raw.path.parentPath.isJSXElement() ? raw.path.parentPath.node : null
+  const mapContext = findMapContext(raw.path)
+  const mapItemExpr = mapContext.isMapped && mapContext.mapFuncPath
+    ? findMapItemExpr(raw.path, mapContext.mapFuncPath, content)
+    : undefined
   return {
     tagName: raw.tagName,
     isComponent: isComponentTag(raw.tagName),
@@ -159,6 +223,8 @@ function toCandidate(raw: RawCandidate, confidence: number): JsxCandidate {
     hrefPreview: literalHrefOf(raw.opening),
     tagStart: raw.opening.start ?? -1,
     tagEnd: raw.opening.end ?? -1,
+    isMapped: mapContext.isMapped,
+    mapItemExpr,
   }
 }
 
@@ -233,9 +299,9 @@ export function locateJsx(params: LocateJsxParams): LocateJsxResult {
     const best = params.sourceCol != null
       ? onLine.reduce((a, b) => (Math.abs(a.col - params.sourceCol!) <= Math.abs(b.col - params.sourceCol!) ? a : b))
       : onLine[0]
-    const candidate = toCandidate(best, 100)
+    const candidate = toCandidate(best, 100, content)
     const allCandidates = all
-      .map((c) => toCandidate(c, scoreCandidate(c, Math.abs(c.line - params.sourceLine), params)))
+      .map((c) => toCandidate(c, scoreCandidate(c, Math.abs(c.line - params.sourceLine), params), content))
       .sort((a, b) => b.confidence - a.confidence)
       .slice(0, 8)
     return {
@@ -256,7 +322,7 @@ export function locateJsx(params: LocateJsxParams): LocateJsxResult {
       .sort((a, b) => b.score - a.score)
 
     const top = scored[0]
-    const candidates = scored.slice(0, 8).map((s) => toCandidate(s.raw, s.score))
+    const candidates = scored.slice(0, 8).map((s) => toCandidate(s.raw, s.score, content))
 
     if (top.score >= 45) {
       return {

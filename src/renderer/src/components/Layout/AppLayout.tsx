@@ -308,9 +308,20 @@ export function AppLayout({
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6" onClick={onCancelScopeChoice}>
           <div className="w-full max-w-md rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-sm font-semibold text-gray-100 mb-1">Apply style to:</h2>
-            <p className="text-xs text-gray-500 mb-4">
+            <p className="text-xs text-gray-500 mb-3">
               This button is rendered by the shared <span className="font-mono text-blue-400">&lt;{pendingScopeChoice.componentName}&gt;</span> component.
             </p>
+            <div className="mb-4 rounded border border-gray-800 bg-gray-950/60 px-2.5 py-2 font-mono text-[10px] text-gray-500 space-y-0.5">
+              <p>Target: <span className="text-gray-300">{pendingScopeChoice.instanceFilePath.split('/').pop()}:{pendingScopeChoice.instanceLine}</span></p>
+              {pendingScopeChoice.identityItemId ? (
+                <p>Target item: <span className="text-gray-300">{pendingScopeChoice.identityItemId}</span></p>
+              ) : (
+                <p>
+                  Identity: <span className="text-gray-300">{pendingScopeChoice.identityText || '(no text)'}</span>
+                  {pendingScopeChoice.identityHref && <> · <span className="text-gray-300">{pendingScopeChoice.identityHref}</span></>}
+                </p>
+              )}
+            </div>
             <div className="space-y-2">
               <button
                 onClick={() => onChooseScope('instance')}
