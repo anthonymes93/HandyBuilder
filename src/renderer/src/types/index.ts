@@ -54,7 +54,89 @@ export interface ComputedStyles {
   backgroundSize: string
   backgroundPosition: string
   transform: string
+  // Typography
+  fontFamily: string
+  fontWeight: string
+  lineHeight: string
+  letterSpacing: string
+  textAlign: string
+  textTransform: string
+  textDecorationLine: string
+  // Border
+  borderTopWidth: string
+  borderStyle: string
+  borderColor: string
+  borderTopLeftRadius: string
+  borderTopRightRadius: string
+  borderBottomRightRadius: string
+  borderBottomLeftRadius: string
+  // Size / layout
+  width: string
+  minWidth: string
+  height: string
+  display: string
+  justifyContent: string
+  alignItems: string
+  // Effects
+  opacity: string
+  boxShadow: string
+  transitionDuration: string
 }
+
+/**
+ * The full set of camelCase CSS properties the visual style editors
+ * (ButtonStyleEditor / TextStyleEditor) can read, live-patch, and save.
+ * Values are raw CSS strings (no unit assumptions beyond what's in the string).
+ */
+export interface StyleProps {
+  // typography
+  fontFamily?: string
+  fontSize?: string
+  fontWeight?: string
+  lineHeight?: string
+  letterSpacing?: string
+  textAlign?: string
+  textTransform?: string
+  textDecoration?: string
+  // colours
+  color?: string
+  backgroundColor?: string
+  borderColor?: string
+  // border
+  borderWidth?: string
+  borderStyle?: string
+  borderRadius?: string
+  borderTopLeftRadius?: string
+  borderTopRightRadius?: string
+  borderBottomRightRadius?: string
+  borderBottomLeftRadius?: string
+  // spacing
+  paddingTop?: string
+  paddingRight?: string
+  paddingBottom?: string
+  paddingLeft?: string
+  marginTop?: string
+  marginRight?: string
+  marginBottom?: string
+  marginLeft?: string
+  // size / alignment
+  width?: string
+  minWidth?: string
+  maxWidth?: string
+  height?: string
+  display?: string
+  justifyContent?: string
+  alignItems?: string
+  gap?: string
+  flexDirection?: string
+  // effects
+  opacity?: string
+  boxShadow?: string
+  transform?: string
+  transitionDuration?: string
+}
+
+export type StyleState = 'normal' | 'hover'
 
 export interface SelectedElement {
   tagName: string
@@ -84,6 +166,9 @@ export interface SelectedElement {
   hbItemId?: string | null
   // Set when a click was resolved up to a closer ancestor (e.g. 'div' means div → a)
   resolvedFrom?: string | null
+  // Stable per-element style class (hb-style-<id>), present once a hover style
+  // has been saved for this element at least once. Deterministic from source location.
+  hbStyleId?: string | null
 }
 
 /** Typed interface for Electron's <webview> element used in PreviewPanel. */
@@ -129,6 +214,11 @@ export interface TextEditPayload {
   editedElementHasChildren?: boolean
   // Per-item identifier for elements inside .map() (from data-hb-item-id, walked up DOM)
   hbItemId?: string | null
+  // Which element field this save represents — drives the history description
+  // and editType (link edits are tagged 'style'-adjacent 'link', not 'text').
+  editKind?: 'text' | 'href'
+  /** Human-readable history entry description (e.g. "Changed heading text"). Falls back to a generated one if omitted. */
+  description?: string
 }
 
 export type MatchStrategy = 'exact' | 'normalized' | 'jsx-word-proximity'
@@ -177,6 +267,8 @@ export interface CommitResult {
   newText?: string
   bytesWritten?: number
   error?: string
+  historyRecorded?: boolean
+  skippedReason?: string
 }
 
 export interface SaveDebugInfo {
@@ -231,6 +323,15 @@ export interface DomPatch {
   backgroundSize?: string
   backgroundPosition?: string
   transform?: string
+  /**
+   * Generic resolved style bag for the visual Button/Text style editors — sent
+   * as ONE full snapshot per change (already merged: normal, or normal+hover
+   * when hover-preview mode is active). The bridge diffs against whatever it
+   * last applied and clears any keys no longer present.
+   */
+  styleProps?: Partial<StyleProps>
+  /** Remove all HandyBuilder-applied inline style overrides (used by Cancel). */
+  clearStyleProps?: true
 }
 
 /** What the Inspector form submits when the user clicks Save. */
@@ -252,6 +353,11 @@ export interface InspectorSavePatch {
   backgroundSize?: string
   backgroundPosition?: string
   transform?: string
+  // Button/Text visual style editor — present only when saving from those editors.
+  styleNormal?: Partial<StyleProps>
+  styleHover?: Partial<StyleProps>
+  /** Human-readable history description, e.g. "Changed button style". */
+  styleDescription?: string
 }
 
 /** Returned by the image file-picker IPC call. */
@@ -282,3 +388,45 @@ export type SaveStatus =
   | 'needs-confirmation'
   | 'needs-binding-picker'
   | 'failed'
+
+// ─── edit history (Undo/Redo) ─────────────────────────────────────────────────
+
+export type HistoryEditType = 'text' | 'image' | 'link' | 'style' | 'ast-binding' | 'manual-edit'
+
+export interface HistoryElementMeta {
+  tagName?: string
+  id?: string | null
+  classList?: string[]
+}
+
+/** One entry as shown in the History panel — no file-content snapshots. */
+export interface HistoryEntrySummary {
+  id: string
+  timestamp: number
+  editType: HistoryEditType
+  filePath: string
+  fileCount: number
+  sourceLine?: number
+  description: string
+  element?: HistoryElementMeta
+}
+
+export interface HistoryState {
+  /** Newest first. */
+  entries: HistoryEntrySummary[]
+  cursor: number
+  canUndo: boolean
+  canRedo: boolean
+  undoDescription?: string
+  redoDescription?: string
+}
+
+export interface HistoryOpResult {
+  success: boolean
+  error?: string
+  /** True when the file on disk didn't match what HandyBuilder expected — nothing was overwritten. */
+  conflict?: boolean
+  description?: string
+  filePath?: string
+  state: HistoryState
+}

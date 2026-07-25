@@ -1,6 +1,8 @@
 import { Monitor, RotateCw, ExternalLink, MousePointer2, Stethoscope } from 'lucide-react'
-import { Project, DevServerStatus, SaveStatus } from '../../types'
+import { Project, DevServerStatus, SaveStatus, HistoryState } from '../../types'
 import { SaveStatusBadge } from '../Editor/SaveStatusBadge'
+import { UndoRedoControls } from './UndoRedoControls'
+import { HistoryPanel } from '../History/HistoryPanel'
 
 interface ToolbarProps {
   project: Project | null
@@ -8,6 +10,9 @@ interface ToolbarProps {
   devServerUrl: string | null
   isInspectMode: boolean
   saveStatus: SaveStatus
+  historyState: HistoryState
+  onUndo: () => void
+  onRedo: () => void
   onReload: () => void
   onOpenInBrowser: () => void
   onToggleInspect: () => void
@@ -38,6 +43,9 @@ export function Toolbar({
   devServerUrl,
   isInspectMode,
   saveStatus,
+  historyState,
+  onUndo,
+  onRedo,
   onReload,
   onOpenInBrowser,
   onToggleInspect,
@@ -97,6 +105,13 @@ export function Toolbar({
         <Stethoscope className="w-3.5 h-3.5" />
         Check HB Injection
       </button>
+
+      <div className="w-px h-5 bg-gray-800 shrink-0" />
+
+      <UndoRedoControls historyState={historyState} onUndo={onUndo} onRedo={onRedo} />
+      <HistoryPanel historyState={historyState} />
+
+      <div className="w-px h-5 bg-gray-800 shrink-0" />
 
       <button
         onClick={onReload}

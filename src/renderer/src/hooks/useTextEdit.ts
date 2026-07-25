@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import {
   Project, TextEditPayload, TextEditAnalysis, SourceMatch,
-  SaveStatus, SaveResult, CommitResult, AstBinding
+  SaveStatus, SaveResult, CommitResult, AstBinding, HistoryEditType, HistoryElementMeta
 } from '../types'
 
 /** Build a stable element key for mapping lookup. */
@@ -15,6 +15,18 @@ export function buildElementKey(
   return `${tagName}${idPart}${clsPart}`
 }
 
+/** Human-readable history description when the caller didn't supply one. */
+function defaultDescription(payload: TextEditPayload): string {
+  if (payload.editKind === 'href') return 'Updated link URL'
+  if (payload.hbItemId) return 'Updated card text'
+  if (/^h[1-6]$/.test(payload.tagName)) return 'Changed heading text'
+  return `Changed text in <${payload.tagName || 'element'}>`
+}
+
+function elementMeta(payload: TextEditPayload): HistoryElementMeta {
+  return { tagName: payload.tagName, id: payload.id, classList: payload.classList }
+}
+
 export interface UseTextEditReturn {
   saveStatus: SaveStatus
   saveResult: SaveResult
@@ -25,7 +37,7 @@ export interface UseTextEditReturn {
   handleCancelConfirmation: () => void
   handleConfirmAstBinding: (binding: AstBinding) => Promise<void>
   handleCancelAstPicker: () => void
-  handleManualCommit: (match: SourceMatch, newText: string) => Promise<CommitResult>
+  handleManualCommit: (match: SourceMatch, newText: string, description?: string) => Promise<CommitResult>
   retryLastSave: () => Promise<void>
   dismissSaveResult: () => void
   /** Directly drive the save badge from outside the hook (e.g. for writeInlineStyle). */
@@ -66,6 +78,10 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
   const [pendingAnalysis, setPendingAnalysis]     = useState<TextEditAnalysis | null>(null)
   const [pendingAstBindings, setPendingAstBindings] = useState<AstBinding[]>([])
 
+  // History metadata for the payload that produced the current confirmation UI —
+  // handleConfirmMatch/handleConfirmAstBinding need this once the user picks.
+  const pendingMetaRef = useRef<{ description: string; editType: HistoryEditType; element?: HistoryElementMeta } | null>(null)
+
   const saveStatus: SaveStatus = saveResult.status
 
   const clearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -91,6 +107,10 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
 
       setSaveResult({ status: 'saving' })
       setPendingAnalysis(null)
+
+      const description = payload.description ?? defaultDescription(payload)
+      const editType: HistoryEditType = payload.editKind === 'href' ? 'link' : 'text'
+      const element = elementMeta(payload)
 
       try {
         // ── fast path: source metadata available (Vite plugin or React fiber) ──
@@ -125,6 +145,10 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
                 newText:         located.newText,
                 actualMatchText: match.actualMatchText,
                 matchOffset:     match.matchOffset,
+                projectPath:     project.path,
+                description,
+                editType,
+                element,
               }),
               SAVE_TIMEOUT_MS,
               'commitTextEdit (located)'
@@ -178,10 +202,14 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
               try {
                 const arrayResult = await withTimeout(
                   window.api.updateArrayItemText({
-                    filePath: payload.sourceFile,
-                    itemId:   payload.hbItemId,
-                    oldText:  payload.oldText.trim(),
-                    newText:  payload.newText.trim(),
+                    filePath:    payload.sourceFile,
+                    itemId:      payload.hbItemId,
+                    oldText:     payload.oldText.trim(),
+                    newText:     payload.newText.trim(),
+                    projectPath: project.path,
+                    description,
+                    editType,
+                    element,
                   }),
                   SAVE_TIMEOUT_MS,
                   'updateArrayItemText'
@@ -230,6 +258,10 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
                     newText:         b.newText,
                     actualMatchText: b.oldText,
                     matchOffset:     b.matchOffset,
+                    projectPath:     project.path,
+                    description,
+                    editType:        'ast-binding',
+                    element,
                   }),
                   SAVE_TIMEOUT_MS,
                   'commitTextEdit (ast-binding)'
@@ -247,6 +279,7 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
                 console.warn('[useTextEdit] ast-binding commit failed:', result.error)
               } else if (astResult.bindings.length > 1) {
                 // Multiple interpretations — show binding picker
+                pendingMetaRef.current = { description, editType: 'ast-binding', element }
                 setPendingAstBindings(astResult.bindings)
                 setSaveResult({ status: 'needs-binding-picker', astBindings: astResult.bindings })
                 return 'needs-binding-picker' as SaveStatus
@@ -370,6 +403,10 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
               newText:         analysis.newText,
               actualMatchText: match.actualMatchText,
               matchOffset:     match.matchOffset,
+              projectPath:     project.path,
+              description,
+              editType,
+              element,
             }),
             SAVE_TIMEOUT_MS,
             'commitTextEdit'
@@ -398,6 +435,7 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
 
         // ── 2c. N matches — needs confirmation ────────────────────────────
         console.log(`[useTextEdit] ${analysis.matchCount} matches → needs-confirmation`)
+        pendingMetaRef.current = { description, editType, element }
         setPendingAnalysis(analysis)
         setSaveResult({ status: 'needs-confirmation' })
         return 'needs-confirmation'
@@ -418,7 +456,7 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
 
   const handleConfirmMatch = useCallback(
     async (match: SourceMatch): Promise<void> => {
-      if (!pendingAnalysis) return
+      if (!pendingAnalysis || !project) return
       if (clearTimerRef.current) clearTimeout(clearTimerRef.current)
 
       const retryPayload: TextEditPayload = {
@@ -426,6 +464,7 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
         oldText: pendingAnalysis.oldText,
         newText: pendingAnalysis.newText,
       }
+      const meta = pendingMetaRef.current
 
       setSaveResult({ status: 'saving' })
 
@@ -439,6 +478,10 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
             newText:         pendingAnalysis.newText,
             actualMatchText: match.actualMatchText,
             matchOffset:     match.matchOffset,
+            projectPath:     project.path,
+            description:     meta?.description ?? 'Changed text',
+            editType:        meta?.editType ?? 'text',
+            element:         meta?.element,
           }),
           SAVE_TIMEOUT_MS,
           'commitTextEdit (confirm)'
@@ -446,12 +489,13 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
 
         console.log('[useTextEdit] confirmed commit result:', result)
         setPendingAnalysis(null)
+        pendingMetaRef.current = null
 
         if (result.success && result.filePath) {
           setSaveResult({
             status:       'saved',
             filePath:     result.filePath,
-            relativePath: toRelative(result.filePath, project?.path),
+            relativePath: toRelative(result.filePath, project.path),
             lineNumber:   result.lineNumber,
           })
           scheduleClear(10_000)
@@ -465,6 +509,7 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
         const error = err instanceof Error ? err.message : String(err)
         console.error('[useTextEdit] handleConfirmMatch caught error:', error)
         setPendingAnalysis(null)
+        pendingMetaRef.current = null
         setSaveResult({ status: 'failed', error, retryPayload })
         scheduleClear(30_000)
       }
@@ -476,7 +521,9 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
 
   const handleConfirmAstBinding = useCallback(
     async (binding: AstBinding): Promise<void> => {
+      if (!project) return
       if (clearTimerRef.current) clearTimeout(clearTimerRef.current)
+      const meta = pendingMetaRef.current
       setSaveResult({ status: 'saving' })
       setPendingAstBindings([])
       try {
@@ -487,15 +534,20 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
             newText:         binding.newText,
             actualMatchText: binding.oldText,
             matchOffset:     binding.matchOffset,
+            projectPath:     project.path,
+            description:     meta?.description ?? 'Updated text via AST binding',
+            editType:        'ast-binding',
+            element:         meta?.element,
           }),
           SAVE_TIMEOUT_MS,
           'commitTextEdit (ast-binding-picked)'
         )
+        pendingMetaRef.current = null
         if (result.success && result.filePath) {
           setSaveResult({
             status:       'saved',
             filePath:     result.filePath,
-            relativePath: toRelative(result.filePath, project?.path),
+            relativePath: toRelative(result.filePath, project.path),
             lineNumber:   result.lineNumber,
           })
           scheduleClear(10_000)
@@ -505,6 +557,7 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
         }
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err)
+        pendingMetaRef.current = null
         setSaveResult({ status: 'failed', error })
         scheduleClear(30_000)
       }
@@ -514,6 +567,7 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
 
   const handleCancelAstPicker = useCallback(() => {
     setPendingAstBindings([])
+    pendingMetaRef.current = null
     setSaveResult({ status: 'dom-only' })
     scheduleClear(30_000)
   }, [])
@@ -524,6 +578,7 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
     if (clearTimerRef.current) clearTimeout(clearTimerRef.current)
     const analysis = pendingAnalysis
     setPendingAnalysis(null)
+    pendingMetaRef.current = null
     setSaveResult({
       status: 'dom-only',
       retryPayload: analysis
@@ -536,7 +591,8 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
   // ── manual commit (Source Locator) ───────────────────────────────────────
 
   const handleManualCommit = useCallback(
-    async (match: SourceMatch, newText: string): Promise<CommitResult> => {
+    async (match: SourceMatch, newText: string, description?: string): Promise<CommitResult> => {
+      if (!project) return { success: false, error: 'No project open' }
       if (clearTimerRef.current) clearTimeout(clearTimerRef.current)
       setSaveResult({ status: 'saving' })
       try {
@@ -547,6 +603,9 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
             newText:         newText.trim(),
             actualMatchText: match.actualMatchText,
             matchOffset:     match.matchOffset,
+            projectPath:     project.path,
+            description:     description ?? `Manually edited source at line ${match.lineNumber}`,
+            editType:        'manual-edit',
           }),
           SAVE_TIMEOUT_MS,
           'commitTextEdit (manual)'
@@ -555,7 +614,7 @@ export function useTextEdit(project: Project | null): UseTextEditReturn {
           setSaveResult({
             status:       'saved',
             filePath:     result.filePath,
-            relativePath: toRelative(result.filePath, project?.path),
+            relativePath: toRelative(result.filePath, project.path),
             lineNumber:   result.lineNumber,
           })
           scheduleClear(10_000)

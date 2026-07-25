@@ -41,7 +41,7 @@ export function classifyElement(el: SelectedElement): ElementKind {
 
 export function isEditable(el: SelectedElement): boolean {
   const kind = classifyElement(el)
-  if (kind === 'button' || kind === 'link' || kind === 'image') return true
+  if (kind === 'button' || kind === 'link' || kind === 'image' || kind === 'text') return true
   // Any element carrying an href is link-editable, even if classified otherwise.
   return Boolean(el.href)
 }

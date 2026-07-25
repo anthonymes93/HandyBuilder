@@ -1,11 +1,14 @@
-import type { ReactNode, ChangeEvent } from 'react'
+import type { ReactNode } from 'react'
 import { useState, useEffect, useRef } from 'react'
 import {
-  SlidersHorizontal, X, Link2, MousePointerClick, ImageIcon, FolderOpen, AlertTriangle, MapPin
+  SlidersHorizontal, X, ImageIcon, FolderOpen, AlertTriangle, MapPin
 } from 'lucide-react'
 import { SelectedElement, InspectorSavePatch, SaveStatus, ImagePickResult, DomPatch } from '../../types'
-import { classifyElement, isEditable, ElementKind } from '../../utils/elementKind'
+import { classifyElement } from '../../utils/elementKind'
 import { SaveStatusBadge } from '../Editor/SaveStatusBadge'
+import { EditField } from './ContentSection'
+import { ButtonStyleEditor } from './ButtonStyleEditor'
+import { TextStyleEditor } from './TextStyleEditor'
 
 // ─── shared primitives ────────────────────────────────────────────────────────
 
@@ -50,30 +53,6 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
     <div className="px-3 py-2 border-b border-gray-800/60">
       <p className="text-[10px] text-gray-700 uppercase tracking-widest mb-1.5 font-medium">{title}</p>
       {children}
-    </div>
-  )
-}
-
-// ─── shared edit field ────────────────────────────────────────────────────────
-
-function EditField({
-  label, value, placeholder, onChange,
-}: {
-  label: string
-  value: string
-  placeholder?: string
-  onChange: (v: string) => void
-}) {
-  return (
-    <div className="mb-2">
-      <p className="text-[10px] text-gray-600 mb-1">{label}</p>
-      <input
-        type="text"
-        value={value}
-        placeholder={placeholder}
-        onChange={(e: ChangeEvent<HTMLInputElement>) => onChange(e.target.value)}
-        className="w-full bg-gray-800 border border-gray-700 focus:border-blue-500 focus:outline-none rounded px-2 py-1.5 text-[11px] text-gray-200 font-mono transition-colors"
-      />
     </div>
   )
 }
@@ -545,142 +524,6 @@ function ImageSection({ element, saveStatus, onSave, onPickFile, onLivePatch }: 
   )
 }
 
-// ─── link / button editable section ──────────────────────────────────────────
-
-function KindIcon({ kind }: { kind: ElementKind }) {
-  if (kind === 'link')   return <Link2 className="w-3 h-3 text-blue-400" />
-  if (kind === 'button') return <MousePointerClick className="w-3 h-3 text-purple-400" />
-  if (kind === 'image')  return <ImageIcon className="w-3 h-3 text-green-400" />
-  return null
-}
-
-interface EditableSectionProps {
-  element: SelectedElement
-  saveStatus: SaveStatus
-  onSave: (patch: InspectorSavePatch) => void
-}
-
-function LinkButtonSection({ element, saveStatus, onSave }: EditableSectionProps) {
-  const kind      = classifyElement(element)
-  const showHref  = element.tagName === 'a' || Boolean(element.href)
-  // Card-level <a> wrappers (hbItemId set) contain the full card as textContent —
-  // that multi-field aggregate is not meaningful to edit as a single text field.
-  const showText  = !showHref || !element.hbItemId
-  const showValue = element.tagName === 'input' && Boolean(element.inputType)
-
-  const originalText     = element.textContent ?? ''
-  const originalHref     = element.href ?? ''
-  const originalDisabled = element.disabled ?? false
-  const originalValue    = element.value ?? ''
-  const originalNewTab   = element.linkTarget === '_blank'
-
-  const [draftText,     setDraftText]     = useState(originalText)
-  const [draftHref,     setDraftHref]     = useState(originalHref)
-  const [draftDisabled, setDraftDisabled] = useState(originalDisabled)
-  const [draftValue,    setDraftValue]    = useState(originalValue)
-  const [draftNewTab,   setDraftNewTab]   = useState(originalNewTab)
-
-  useEffect(() => {
-    setDraftText(element.textContent ?? '')
-    setDraftHref(element.href ?? '')
-    setDraftDisabled(element.disabled ?? false)
-    setDraftValue(element.value ?? '')
-    setDraftNewTab(element.linkTarget === '_blank')
-  }, [element])
-
-  const textChanged     = showText && draftText.trim()  !== originalText.trim()
-  const hrefChanged     = draftHref.trim()  !== originalHref.trim()
-  const disabledChanged = draftDisabled     !== originalDisabled
-  const valueChanged    = draftValue.trim() !== originalValue.trim()
-  const newTabChanged   = draftNewTab       !== originalNewTab
-  const hasChanges      = textChanged || hrefChanged || disabledChanged || valueChanged || newTabChanged
-
-  function handleSave() {
-    const patch: InspectorSavePatch = { element }
-    if (textChanged)     patch.text       = draftText.trim()
-    if (hrefChanged)     patch.href       = draftHref.trim()
-    if (disabledChanged) patch.disabled   = draftDisabled
-    if (valueChanged)    patch.text       = draftValue.trim()
-    if (newTabChanged)   patch.linkTarget = draftNewTab ? '_blank' : ''
-    onSave(patch)
-  }
-
-  function handleCancel() {
-    setDraftText(originalText)
-    setDraftHref(originalHref)
-    setDraftDisabled(originalDisabled)
-    setDraftValue(originalValue)
-    setDraftNewTab(originalNewTab)
-  }
-
-  return (
-    <div className="px-3 py-2 border-b border-gray-800/60">
-      <div className="flex items-center gap-1.5 mb-2">
-        <KindIcon kind={kind} />
-        <p className="text-[10px] text-gray-700 uppercase tracking-widest font-medium">Editable</p>
-      </div>
-
-      {showText && !showValue && (
-        <EditField label="Text" value={draftText} placeholder="Element text…" onChange={setDraftText} />
-      )}
-      {showValue && (
-        <EditField label="Value" value={draftValue} placeholder="Button value…" onChange={setDraftValue} />
-      )}
-
-      {showHref && (
-        <EditField label="Href" value={draftHref} placeholder="https://…" onChange={setDraftHref} />
-      )}
-
-      {showHref && (
-        <label className="flex items-center gap-2 mb-2 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={draftNewTab}
-            onChange={(e) => setDraftNewTab(e.target.checked)}
-            className="accent-blue-500"
-          />
-          <span className="text-[11px] text-gray-400">Open in new tab</span>
-        </label>
-      )}
-
-      {(element.tagName === 'button' || element.tagName === 'input') && (
-        <label className="flex items-center gap-2 mb-2 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={draftDisabled}
-            onChange={(e) => setDraftDisabled(e.target.checked)}
-            className="accent-blue-500"
-          />
-          <span className="text-[11px] text-gray-400">Disabled</span>
-        </label>
-      )}
-
-      <div className="flex items-center gap-2 mt-1">
-        <button
-          onClick={handleSave}
-          disabled={!hasChanges || saveStatus === 'saving'}
-          className="flex-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-30 disabled:cursor-not-allowed text-white text-xs rounded transition-colors"
-        >
-          Save
-        </button>
-        <button
-          onClick={handleCancel}
-          disabled={!hasChanges}
-          className="px-3 py-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed text-xs rounded border border-gray-800 hover:border-gray-700 transition-colors"
-        >
-          Cancel
-        </button>
-      </div>
-
-      {saveStatus !== 'idle' && (
-        <div className="mt-2 flex justify-center">
-          <SaveStatusBadge status={saveStatus} />
-        </div>
-      )}
-    </div>
-  )
-}
-
 // ─── source metadata debug panel ─────────────────────────────────────────────
 
 function SourceMetaSection({ element }: { element: SelectedElement }) {
@@ -799,6 +642,7 @@ interface InspectorPanelProps {
   onInspectorSave: (patch: InspectorSavePatch) => void
   onPickFile: () => Promise<ImagePickResult | null>
   onLivePatch: (patch: DomPatch) => void
+  onOpenFile: (filePath: string) => void
 }
 
 export function InspectorPanel({
@@ -809,9 +653,10 @@ export function InspectorPanel({
   onInspectorSave,
   onPickFile,
   onLivePatch,
+  onOpenFile,
 }: InspectorPanelProps) {
   return (
-    <div className="w-60 flex flex-col bg-gray-900 border-l border-gray-800 shrink-0 overflow-hidden">
+    <div className="w-72 flex flex-col bg-gray-900 border-l border-gray-800 shrink-0 overflow-hidden">
       <div className="h-9 flex items-center justify-between px-3 border-b border-gray-800 shrink-0">
         <div className="flex items-center gap-2">
           <SlidersHorizontal className="w-3.5 h-3.5 text-gray-600" />
@@ -838,91 +683,106 @@ export function InspectorPanel({
         </div>
       ) : (
         <div className="flex-1 overflow-y-auto">
-          {/* Source metadata — MUST be first so it's always visible */}
-          <SourceMetaSection element={selectedElement} />
-
-          {/* Identity */}
-          <Section title="Element">
-            <div className="flex flex-wrap items-baseline gap-1">
-              <span className="font-mono text-blue-400 text-sm">&lt;{selectedElement.tagName}&gt;</span>
-              {selectedElement.id && (
-                <span className="font-mono text-yellow-400 text-[11px]">#{selectedElement.id}</span>
-              )}
-            </div>
-            {selectedElement.classList.length > 0 && (
-              <div className="flex flex-wrap gap-1 mt-1.5">
-                {selectedElement.classList.map((c) => (
-                  <span key={c} className="font-mono text-[10px] text-gray-400 bg-gray-800 px-1.5 py-0.5 rounded">.{c}</span>
-                ))}
-              </div>
-            )}
-            {selectedElement.resolvedFrom && (
-              <div className="mt-1.5 text-[10px] text-gray-500">
-                Resolved from: <span className="font-mono text-gray-400">{selectedElement.resolvedFrom}</span>
-                <span className="text-gray-600"> → </span>
-                <span className="font-mono text-blue-400">{selectedElement.tagName}</span>
-              </div>
-            )}
-          </Section>
-
-          {/* Editable section — image, link, or button */}
-          {isEditable(selectedElement) && (() => {
+          {(() => {
             const kind = classifyElement(selectedElement)
-            if (kind === 'image') {
+
+            if (kind === 'button' || kind === 'link') {
               return (
-                <ImageSection
+                <ButtonStyleEditor
                   element={selectedElement}
                   saveStatus={saveStatus}
                   onSave={onInspectorSave}
-                  onPickFile={onPickFile}
                   onLivePatch={onLivePatch}
+                  onOpenFile={onOpenFile}
                 />
               )
             }
+
+            if (kind === 'text') {
+              return (
+                <TextStyleEditor
+                  element={selectedElement}
+                  saveStatus={saveStatus}
+                  onSave={onInspectorSave}
+                  onLivePatch={onLivePatch}
+                  onOpenFile={onOpenFile}
+                />
+              )
+            }
+
+            // Image, container, and anything else — original compact layout.
             return (
-              <LinkButtonSection
-                element={selectedElement}
-                saveStatus={saveStatus}
-                onSave={onInspectorSave}
-              />
+              <>
+                <SourceMetaSection element={selectedElement} />
+
+                <Section title="Element">
+                  <div className="flex flex-wrap items-baseline gap-1">
+                    <span className="font-mono text-blue-400 text-sm">&lt;{selectedElement.tagName}&gt;</span>
+                    {selectedElement.id && (
+                      <span className="font-mono text-yellow-400 text-[11px]">#{selectedElement.id}</span>
+                    )}
+                  </div>
+                  {selectedElement.classList.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-1.5">
+                      {selectedElement.classList.map((c) => (
+                        <span key={c} className="font-mono text-[10px] text-gray-400 bg-gray-800 px-1.5 py-0.5 rounded">.{c}</span>
+                      ))}
+                    </div>
+                  )}
+                  {selectedElement.resolvedFrom && (
+                    <div className="mt-1.5 text-[10px] text-gray-500">
+                      Resolved from: <span className="font-mono text-gray-400">{selectedElement.resolvedFrom}</span>
+                      <span className="text-gray-600"> → </span>
+                      <span className="font-mono text-blue-400">{selectedElement.tagName}</span>
+                    </div>
+                  )}
+                </Section>
+
+                {kind === 'image' && (
+                  <ImageSection
+                    element={selectedElement}
+                    saveStatus={saveStatus}
+                    onSave={onInspectorSave}
+                    onPickFile={onPickFile}
+                    onLivePatch={onLivePatch}
+                  />
+                )}
+
+                <Section title="Box Model">
+                  <Prop label="Size">
+                    <span className="text-gray-300">{selectedElement.rect.width}&thinsp;×&thinsp;{selectedElement.rect.height} px</span>
+                  </Prop>
+                  <Prop label="Margin">
+                    <span className="text-gray-300 font-mono">
+                      {shorthand(selectedElement.computed.marginTop, selectedElement.computed.marginRight, selectedElement.computed.marginBottom, selectedElement.computed.marginLeft)}
+                    </span>
+                  </Prop>
+                  <Prop label="Padding">
+                    <span className="text-gray-300 font-mono">
+                      {shorthand(selectedElement.computed.paddingTop, selectedElement.computed.paddingRight, selectedElement.computed.paddingBottom, selectedElement.computed.paddingLeft)}
+                    </span>
+                  </Prop>
+                </Section>
+
+                <Section title="Typography">
+                  <Prop label="Font size"><span className="text-gray-300 font-mono">{selectedElement.computed.fontSize}</span></Prop>
+                  <Prop label="Color"><ColorSwatch color={selectedElement.computed.color} /></Prop>
+                </Section>
+
+                <Section title="Background">
+                  <Prop label="Color"><ColorSwatch color={selectedElement.computed.backgroundColor} /></Prop>
+                </Section>
+
+                {selectedElement.textContent && (
+                  <Section title="Content">
+                    <p className="text-gray-500 text-[11px] font-mono leading-relaxed break-words line-clamp-5">
+                      &ldquo;{selectedElement.textContent}&rdquo;
+                    </p>
+                  </Section>
+                )}
+              </>
             )
           })()}
-
-          {/* Box model */}
-          <Section title="Box Model">
-            <Prop label="Size">
-              <span className="text-gray-300">{selectedElement.rect.width}&thinsp;×&thinsp;{selectedElement.rect.height} px</span>
-            </Prop>
-            <Prop label="Margin">
-              <span className="text-gray-300 font-mono">
-                {shorthand(selectedElement.computed.marginTop, selectedElement.computed.marginRight, selectedElement.computed.marginBottom, selectedElement.computed.marginLeft)}
-              </span>
-            </Prop>
-            <Prop label="Padding">
-              <span className="text-gray-300 font-mono">
-                {shorthand(selectedElement.computed.paddingTop, selectedElement.computed.paddingRight, selectedElement.computed.paddingBottom, selectedElement.computed.paddingLeft)}
-              </span>
-            </Prop>
-          </Section>
-
-          {/* Typography */}
-          <Section title="Typography">
-            <Prop label="Font size"><span className="text-gray-300 font-mono">{selectedElement.computed.fontSize}</span></Prop>
-            <Prop label="Color"><ColorSwatch color={selectedElement.computed.color} /></Prop>
-          </Section>
-
-          {/* Background */}
-          <Section title="Background">
-            <Prop label="Color"><ColorSwatch color={selectedElement.computed.backgroundColor} /></Prop>
-          </Section>
-
-          {selectedElement.textContent && (
-            <Section title="Content">
-              <p className="text-gray-500 text-[11px] font-mono leading-relaxed break-words line-clamp-5">
-                &ldquo;{selectedElement.textContent}&rdquo;
-              </p>
-            </Section>
-          )}
         </div>
       )}
     </div>

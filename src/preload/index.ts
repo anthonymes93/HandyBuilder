@@ -1,6 +1,14 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
+type HistoryEditType = 'text' | 'image' | 'link' | 'style' | 'ast-binding' | 'manual-edit'
+
+interface HistoryElementMeta {
+  tagName?: string
+  id?: string | null
+  classList?: string[]
+}
+
 const api = {
   openProject: () => ipcRenderer.invoke('project:open'),
   getProject: () => ipcRenderer.invoke('project:get'),
@@ -41,13 +49,17 @@ const api = {
     newText: string
   }) => ipcRenderer.invoke('editor:analyze-located', params),
 
-  /** Write newText in place of oldText in the given file. */
+  /** Write newText in place of oldText in the given file. Records one undo/redo history entry. */
   commitTextEdit: (params: {
     filePath: string
     oldText: string
     newText: string
     actualMatchText?: string
     matchOffset?: number
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
   }) => ipcRenderer.invoke('editor:commit-text-edit', params),
 
   /** Search the project with any query — used by the Source Locator panel. */
@@ -71,28 +83,40 @@ const api = {
   readProjectFile: (params: { filePath: string; projectPath: string }) =>
     ipcRenderer.invoke('editor:read-file', params),
 
-  /** Write or merge a JSX inline style prop using source file + line metadata. */
+  /** Write or merge a JSX inline style prop using source file + line metadata. Records one undo/redo history entry. */
   writeInlineStyle: (params: {
     filePath: string
     lineNumber: number
     styleProps: Record<string, string>
     tagName?: string
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
   }) => ipcRenderer.invoke('editor:write-inline-style', params),
 
-  /** Update a single property on an array item identified by a unique string value. */
+  /** Update a single property on an array item identified by a unique string value. Records one undo/redo history entry. */
   writeArrayItemProp: (params: {
     filePath: string
     itemId: string
     propName: string
     propValue: string
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
   }) => ipcRenderer.invoke('editor:write-array-item-prop', params),
 
-  /** Update a text field value inside a specific array item (find by itemId, replace oldText with newText). */
+  /** Update a text field value inside a specific array item (find by itemId, replace oldText with newText). Records one undo/redo history entry. */
   updateArrayItemText: (params: {
     filePath: string
     itemId: string
     oldText: string
     newText: string
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
   }) => ipcRenderer.invoke('editor:update-array-item-text', params),
 
   /** Parse the source file AST and resolve what produces the displayed text at a given line. */
@@ -104,11 +128,66 @@ const api = {
     displayedNew: string
   }) => ipcRenderer.invoke('editor:ast-locate-binding', params),
 
+  /** Update <img> src/alt/width/height attributes via Babel AST — dedicated image writer, never text search. Records one undo/redo history entry. */
+  writeImageAttrs: (params: {
+    filePath: string
+    lineNumber: number
+    tagName?: string
+    src?: string
+    alt?: string
+    width?: string
+    height?: string
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
+  }) => ipcRenderer.invoke('editor:write-image-attrs', params),
+
+  /**
+   * Visual Button/Text style editor Save. Merges normal-state properties into
+   * style={{}} (reconciling recognised Tailwind utilities); if hoverStyleProps
+   * is given, attaches a stable hb-style-<id> class and writes/merges a
+   * `:hover` rule into a shared project stylesheet. One atomic multi-file
+   * transaction — a single Undo/Redo step covering both files.
+   */
+  writeElementStyle: (params: {
+    filePath: string
+    lineNumber: number
+    tagName?: string
+    normalStyleProps: Record<string, string>
+    hoverStyleProps?: Record<string, string>
+    projectPath: string
+    description: string
+    element?: HistoryElementMeta
+  }) => ipcRenderer.invoke('editor:write-element-style', params),
+
   /** Open a file in the system default editor (e.g. VS Code). */
   openFileInEditor: (filePath: string) => ipcRenderer.invoke('editor:open-file', filePath),
 
   /** Reveal a file in the OS file manager. */
-  showInFolder: (filePath: string) => ipcRenderer.invoke('editor:show-in-folder', filePath)
+  showInFolder: (filePath: string) => ipcRenderer.invoke('editor:show-in-folder', filePath),
+
+  // ── Edit history (Undo/Redo) ──────────────────────────────────────────────
+
+  /** Current undo/redo stacks + recent entries for the History panel. */
+  getHistoryState: (params: { projectPath: string }) =>
+    ipcRenderer.invoke('history:get-state', params),
+
+  /** Undo the most recent recorded edit — writes beforeContent back to disk. */
+  undoHistory: (params: { projectPath: string }) =>
+    ipcRenderer.invoke('history:undo', params),
+
+  /** Redo the most recently undone edit — writes afterContent back to disk. */
+  redoHistory: (params: { projectPath: string }) =>
+    ipcRenderer.invoke('history:redo', params),
+
+  /** Clear all edit history for a project. */
+  clearHistory: (params: { projectPath: string }) =>
+    ipcRenderer.invoke('history:clear', params),
+
+  /** Drop history entries for one file — used after an external-change conflict. */
+  discardFileHistory: (params: { projectPath: string; filePath: string }) =>
+    ipcRenderer.invoke('history:discard-file', params)
 }
 
 if (process.contextIsolated) {

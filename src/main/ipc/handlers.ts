@@ -14,6 +14,17 @@ import {
 } from '../editor/fileEditor'
 import { writeInlineStyle, WriteInlineStyleParams, writeArrayItemProp, WriteArrayItemPropParams, updateArrayItemText, UpdateArrayItemTextParams } from '../editor/styleWriter'
 import { astLocateBinding, AstLocateParams } from '../editor/astEditor'
+import { writeImageAttrs, WriteImageAttrsParams } from '../editor/imageWriter'
+import { writeElementStyle, WriteElementStyleParams } from '../editor/elementStyleWriter'
+import {
+  getHistoryState,
+  recordHistoryEntry,
+  undoHistory,
+  redoHistory,
+  clearHistory,
+  discardHistoryForFile,
+  RecordEntryParams
+} from '../editor/historyManager'
 import {
   getMapping,
   saveMapping,
@@ -113,6 +124,48 @@ export function setupIpcHandlers(
   ipcMain.handle('editor:ast-locate-binding', (_e: IpcMainInvokeEvent, params: AstLocateParams) =>
     astLocateBinding(params)
   )
+
+  // Update <img> src/alt/width/height attributes directly via AST — never via text search.
+  ipcMain.handle('editor:write-image-attrs', (_e: IpcMainInvokeEvent, params: WriteImageAttrsParams) =>
+    writeImageAttrs(params)
+  )
+
+  // Visual Button/Text style editor Save — normal styles inline, hover styles
+  // via a stable class + shared stylesheet. One atomic multi-file transaction.
+  ipcMain.handle('editor:write-element-style', (_e: IpcMainInvokeEvent, params: WriteElementStyleParams) =>
+    writeElementStyle(params)
+  )
+
+  // ── Edit history (Undo/Redo) ────────────────────────────────────────────
+  ipcMain.handle('history:get-state', (_e: IpcMainInvokeEvent, params: { projectPath: string }) =>
+    getHistoryState(params.projectPath)
+  )
+
+  // Record a history entry directly (for editors that don't go through
+  // applySourceTransaction). Every current writer already records automatically.
+  ipcMain.handle('history:record', (
+    _e: IpcMainInvokeEvent,
+    params: { projectPath: string } & RecordEntryParams
+  ) => recordHistoryEntry(params.projectPath, params))
+
+  ipcMain.handle('history:undo', (_e: IpcMainInvokeEvent, params: { projectPath: string }) =>
+    undoHistory(params.projectPath)
+  )
+
+  ipcMain.handle('history:redo', (_e: IpcMainInvokeEvent, params: { projectPath: string }) =>
+    redoHistory(params.projectPath)
+  )
+
+  ipcMain.handle('history:clear', (_e: IpcMainInvokeEvent, params: { projectPath: string }) =>
+    clearHistory(params.projectPath)
+  )
+
+  // Drop history entries referencing one file — used when Undo/Redo detects
+  // the file was changed outside HandyBuilder and the user opts to discard.
+  ipcMain.handle('history:discard-file', (
+    _e: IpcMainInvokeEvent,
+    params: { projectPath: string; filePath: string }
+  ) => discardHistoryForFile(params.projectPath, params.filePath))
 
   // Open a file in the system default editor (e.g. VS Code).
   ipcMain.handle('editor:open-file', async (_e: IpcMainInvokeEvent, filePath: string) => {

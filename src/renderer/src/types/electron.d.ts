@@ -2,9 +2,18 @@ import type { HTMLAttributes, Ref } from 'react'
 import { ElectronAPI } from '@electron-toolkit/preload'
 import {
   FileNode, Project, ProjectOpenResult, DevServerStatus,
-  TextEditAnalysis, CommitResult, ImagePickResult, ElementMapping
+  TextEditAnalysis, CommitResult, ImagePickResult, ElementMapping,
+  HistoryEditType, HistoryElementMeta, HistoryState, HistoryOpResult
 } from '.'
 
+interface WriteResult {
+  success: boolean
+  filePath?: string
+  lineNumber?: number
+  error?: string
+  historyRecorded?: boolean
+  skippedReason?: string
+}
 
 export interface HandyBuilderAPI {
   openProject: () => Promise<ProjectOpenResult | null>
@@ -40,6 +49,10 @@ export interface HandyBuilderAPI {
     newText: string
     actualMatchText?: string
     matchOffset?: number
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
   }) => Promise<CommitResult>
   searchProject: (params: { projectPath: string; query: string; newText: string }) => Promise<TextEditAnalysis>
   getElementMapping: (params: { projectPath: string; key: string }) => Promise<ElementMapping | null>
@@ -51,19 +64,31 @@ export interface HandyBuilderAPI {
     lineNumber: number
     styleProps: Record<string, string>
     tagName?: string
-  }) => Promise<{ success: boolean; filePath?: string; lineNumber?: number; error?: string }>
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
+  }) => Promise<WriteResult>
   writeArrayItemProp: (params: {
     filePath: string
     itemId: string
     propName: string
     propValue: string
-  }) => Promise<{ success: boolean; filePath?: string; lineNumber?: number; error?: string }>
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
+  }) => Promise<WriteResult>
   updateArrayItemText: (params: {
     filePath: string
     itemId: string
     oldText: string
     newText: string
-  }) => Promise<{ success: boolean; filePath?: string; lineNumber?: number; error?: string }>
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
+  }) => Promise<WriteResult>
   astLocateBinding: (params: {
     filePath: string
     lineNumber: number
@@ -75,8 +100,38 @@ export interface HandyBuilderAPI {
     bindings: import('.').AstBinding[]
     reason: string
   }>
+  writeImageAttrs: (params: {
+    filePath: string
+    lineNumber: number
+    tagName?: string
+    src?: string
+    alt?: string
+    width?: string
+    height?: string
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
+  }) => Promise<WriteResult & { updatedAttrs?: string[] }>
+  writeElementStyle: (params: {
+    filePath: string
+    lineNumber: number
+    tagName?: string
+    normalStyleProps: Record<string, string>
+    hoverStyleProps?: Record<string, string>
+    projectPath: string
+    description: string
+    element?: HistoryElementMeta
+  }) => Promise<WriteResult & { hoverPersisted?: boolean; hoverWarning?: string; styleId?: string }>
   openFileInEditor: (filePath: string) => Promise<{ success: true } | { error: string }>
   showInFolder: (filePath: string) => Promise<void>
+
+  // ── Edit history (Undo/Redo) ────────────────────────────────────────────
+  getHistoryState: (params: { projectPath: string }) => Promise<HistoryState>
+  undoHistory: (params: { projectPath: string }) => Promise<HistoryOpResult>
+  redoHistory: (params: { projectPath: string }) => Promise<HistoryOpResult>
+  clearHistory: (params: { projectPath: string }) => Promise<HistoryState>
+  discardFileHistory: (params: { projectPath: string; filePath: string }) => Promise<HistoryState>
 }
 
 declare global {

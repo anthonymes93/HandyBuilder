@@ -2,10 +2,15 @@ import { useRef, useState, useCallback, useEffect, useMemo } from 'react'
 import { useProject } from './hooks/useProject'
 import { useDevServer } from './hooks/useDevServer'
 import { useTextEdit, buildElementKey } from './hooks/useTextEdit'
+import { useEditHistory } from './hooks/useEditHistory'
 import { AppLayout } from './components/Layout/AppLayout'
-import { SelectedElement, InspectorSavePatch, ImagePickResult, TextEditPayload, SourceMatch, DomPatch } from './types'
+import { SelectedElement, InspectorSavePatch, ImagePickResult, TextEditPayload, SourceMatch, DomPatch, HistoryElementMeta } from './types'
 import type { PreviewFrameHandle } from './components/Preview/PreviewPanel'
 import type { HbInjectionDiagnostic } from './components/Preview/PreviewPanel'
+
+function elementMeta(el: SelectedElement): HistoryElementMeta {
+  return { tagName: el.tagName, id: el.id, classList: el.classList }
+}
 
 function App() {
   const { project, fileTree, isLoading, openProject } = useProject()
@@ -39,6 +44,18 @@ function App() {
     reportDirectWrite,
   } = useTextEdit(project)
 
+  const {
+    historyState,
+    undo: undoHistory,
+    redo: redoHistory,
+    refresh: refreshHistory,
+    conflict: historyConflict,
+    dismissConflict: dismissHistoryConflict,
+    discardConflictFileHistory,
+    notice: historyNotice,
+    dismissNotice: dismissHistoryNotice,
+  } = useEditHistory(project)
+
   const [isInspectMode, setIsInspectMode] = useState(false)
   const [selectedElement, setSelectedElement] = useState<SelectedElement | null>(null)
   const [bridgePath, setBridgePath] = useState<string | null>(null)
@@ -51,6 +68,40 @@ function App() {
   useEffect(() => {
     window.api.getInspectorBridgePath().then(setBridgePath)
   }, [])
+
+  // Refresh the undo/redo stacks whenever a save completes — every source
+  // writer (text, image, link, style, AST binding, manual edit) funnels
+  // through applySourceTransaction in the main process and records history
+  // automatically, so the renderer just needs to re-fetch the latest state.
+  useEffect(() => {
+    if (saveStatus === 'saved') refreshHistory()
+  }, [saveStatus, saveResult, refreshHistory])
+
+  // Keyboard shortcuts: Ctrl+Z (Undo), Ctrl+Shift+Z / Ctrl+Y (Redo).
+  // Cmd on macOS. Ignored while typing in a text input/textarea/contenteditable
+  // in the host UI; the <webview> preview has its own isolated key handling.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const mod = e.ctrlKey || e.metaKey
+      if (!mod) return
+      const target = e.target as HTMLElement | null
+      const tag = target?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) return
+
+      if (e.key.toLowerCase() === 'z' && e.shiftKey) {
+        e.preventDefault()
+        redoHistory()
+      } else if (e.key.toLowerCase() === 'z') {
+        e.preventDefault()
+        undoHistory()
+      } else if (e.key.toLowerCase() === 'y') {
+        e.preventDefault()
+        redoHistory()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [undoHistory, redoHistory])
 
   const handleToggleInspect = useCallback(() => {
     setIsInspectMode((prev) => {
@@ -169,6 +220,7 @@ function App() {
   const handleInspectorSave = useCallback(
     async (patch: InspectorSavePatch) => {
       const el = patch.element
+      const projectPath = project?.path
 
       // Apply changes to the live preview DOM immediately.
       previewRef.current?.applyDomPatch({
@@ -188,6 +240,35 @@ function App() {
         transform:          patch.transform,
       })
 
+      // ── Visual Button/Text style editor save ────────────────────────────────
+      // Normal styles merge into style={{}} (Tailwind-safe-subset reconciled);
+      // hover styles attach a stable class + write to a shared stylesheet.
+      // Both files land in ONE atomic multi-file transaction — one Undo step.
+      if (patch.styleNormal || patch.styleHover) {
+        if (!projectPath || !el.hbSourceFile || !el.hbSourceLine) {
+          reportDirectWrite({ success: false, error: 'No source location found for this element — cannot save style to file.' })
+          return
+        }
+        console.log('[app] writeElementStyle →', el.hbSourceFile, 'line', el.hbSourceLine, patch.styleNormal, patch.styleHover)
+        const result = await window.api.writeElementStyle({
+          filePath: el.hbSourceFile,
+          lineNumber: el.hbSourceLine,
+          tagName: el.tagName,
+          normalStyleProps: (patch.styleNormal ?? {}) as Record<string, string>,
+          hoverStyleProps: patch.styleHover as Record<string, string> | undefined,
+          projectPath,
+          description: patch.styleDescription ?? 'Changed element style',
+          element: elementMeta(el),
+        })
+        if (result.hoverWarning) console.warn('[app] hover style warning:', result.hoverWarning)
+        reportDirectWrite(
+          result.success
+            ? { success: true, filePath: result.filePath, lineNumber: result.lineNumber }
+            : { success: false, error: result.error }
+        )
+        return
+      }
+
       // ── Image display-style save (new path) ────────────────────────────────
       // When source metadata is available, write a real inline style={{ }} prop
       // rather than using the fuzzy text-search pipeline.
@@ -201,7 +282,15 @@ function App() {
         patch.backgroundImage    !== undefined
 
       if (hasStyleProps && el.hbSourceFile && el.hbSourceLine) {
+        if (!projectPath) {
+          reportDirectWrite({ success: false, error: 'No project open — cannot save to file.' })
+          return
+        }
+
         const styleProps: Record<string, string> = {}
+        type WriteOutcome = { success: boolean; filePath?: string; lineNumber?: number; error?: string }
+        const outcomes: WriteOutcome[] = []
+        const meta = elementMeta(el)
 
         if (el.tagName === 'img') {
           if (patch.objectFit      !== undefined) styleProps.objectFit      = patch.objectFit
@@ -219,10 +308,14 @@ function App() {
             if (m) {
               console.log('[app] writeArrayItemProp →', el.hbSourceFile, 'item', el.hbItemId, 'image:', m[1])
               const result = await window.api.writeArrayItemProp({
-                filePath:  el.hbSourceFile,
-                itemId:    el.hbItemId,
-                propName:  'image',
-                propValue: m[1],
+                filePath:    el.hbSourceFile,
+                itemId:      el.hbItemId,
+                propName:    'image',
+                propValue:   m[1],
+                projectPath,
+                description: 'Replaced background image',
+                editType:    'image',
+                element:     meta,
               })
               reportDirectWrite(result)
             }
@@ -240,39 +333,90 @@ function App() {
         }
 
         if (Object.keys(styleProps).length > 0) {
+          // Describe what the user actually changed so the history entry reads
+          // naturally (e.g. "Changed image focal point" rather than "Changed style").
+          let description = 'Changed image style'
+          let editType: 'style' | 'image' = 'style'
+          if (el.tagName === 'img') {
+            const fitChanged  = patch.objectFit      !== undefined && patch.objectFit      !== el.computed.objectFit
+            const posChanged  = patch.objectPosition !== undefined && patch.objectPosition !== el.computed.objectPosition
+            const zoomChanged = patch.transform      !== undefined && patch.transform      !== el.computed.transform
+            if (posChanged && !fitChanged && !zoomChanged) description = 'Changed image focal point'
+            else if (zoomChanged && !posChanged && !fitChanged) description = 'Changed image zoom'
+            else if (fitChanged && !posChanged && !zoomChanged) description = 'Changed image fit'
+          } else {
+            editType = 'image'
+            description = patch.backgroundImage !== undefined ? 'Replaced background image' : 'Changed background style'
+          }
+
           console.log('[app] writeInlineStyle →', el.hbSourceFile, 'line', el.hbSourceLine, styleProps)
           const result = await window.api.writeInlineStyle({
             filePath:   el.hbSourceFile,
             lineNumber: el.hbSourceLine,
             styleProps,
             tagName:    el.tagName,
+            projectPath,
+            description,
+            editType,
+            element: meta,
           })
-          reportDirectWrite(result)
+          outcomes.push(result)
         }
 
-        // Attribute-level saves for img (src, alt, width, height) still go
-        // through the text-search pipeline when there's no dedicated IPC for them.
+        // ── <img> attribute save (src/alt/width/height) ────────────────────
+        // Images have no visible text to search for — the fuzzy text-search
+        // pipeline (handleTextSaved / analyzeLocatedEdit / AST text binding
+        // resolver) must never be used here. Parse the file with Babel and
+        // write the exact attribute spans instead.
         if (el.tagName === 'img') {
-          type SavePair = { oldText: string; newText: string }
-          const saves: SavePair[] = []
-          function pushAttr(old: string | null | undefined, next: string | undefined) {
+          const attrs: { src?: string; alt?: string; width?: string; height?: string } = {}
+          const setAttr = (
+            key: 'src' | 'alt' | 'width' | 'height',
+            old: string | null | undefined,
+            next: string | undefined
+          ) => {
             if (next === undefined) return
             const o = (old ?? '').trim()
             const n = next.trim()
-            if (n && n !== o) saves.push({ oldText: o, newText: n })
+            if (n && n !== o) attrs[key] = n
           }
-          pushAttr(el.imageSrc, patch.imageSrc)
-          pushAttr(el.imageAlt, patch.imageAlt)
-          for (const { oldText, newText } of saves) {
-            if (!oldText || !newText) continue
-            await handleTextSaved({
+          setAttr('src',    el.imageSrc,    patch.imageSrc)
+          setAttr('alt',    el.imageAlt,    patch.imageAlt)
+          setAttr('width',  el.imageWidth,  patch.imageWidth)
+          setAttr('height', el.imageHeight, patch.imageHeight)
+
+          if (Object.keys(attrs).length > 0) {
+            let description = 'Updated image'
+            if (attrs.src !== undefined) description = 'Replaced image'
+            else if (attrs.alt !== undefined) description = 'Updated image alt text'
+            else if (attrs.width !== undefined || attrs.height !== undefined) description = 'Resized image'
+
+            console.log('[app] writeImageAttrs →', el.hbSourceFile, 'line', el.hbSourceLine, attrs)
+            const result = await window.api.writeImageAttrs({
+              filePath:   el.hbSourceFile,
+              lineNumber: el.hbSourceLine,
               tagName:    el.tagName,
-              oldText,
-              newText,
-              sourceFile: el.hbSourceFile ?? undefined,
-              sourceLine: el.hbSourceLine ?? undefined,
-              sourceCol:  el.hbSourceCol  ?? undefined,
+              ...attrs,
+              projectPath,
+              description,
+              editType: 'image',
+              element: meta,
             })
+            outcomes.push(result)
+          }
+        }
+
+        // Report one combined result so a failed write is never masked by an
+        // earlier successful one (e.g. style saved but src attribute failed).
+        // Only a verified successful file write shows "Saved" — the live DOM
+        // patch above already ran unconditionally and does not affect this.
+        if (outcomes.length > 0) {
+          const failed = outcomes.find((o) => !o.success)
+          if (failed) {
+            reportDirectWrite({ success: false, error: failed.error ?? 'Image save failed' })
+          } else {
+            const last = outcomes[outcomes.length - 1]
+            reportDirectWrite({ success: true, filePath: last.filePath, lineNumber: last.lineNumber })
           }
         }
 
@@ -287,12 +431,20 @@ function App() {
         const oldHref = (el.href ?? '').trim()
         const newHref = patch.href.trim()
         if (oldHref && newHref && newHref !== oldHref) {
+          if (!projectPath) {
+            reportDirectWrite({ success: false, error: 'No project open — cannot save to file.' })
+            return
+          }
           console.log('[app] updateArrayItemText for href →', el.hbSourceFile, 'item', el.hbItemId)
           const result = await window.api.updateArrayItemText({
             filePath: el.hbSourceFile,
             itemId:   el.hbItemId,
             oldText:  oldHref,
             newText:  newHref,
+            projectPath,
+            description: 'Updated button URL',
+            editType: 'link',
+            element: elementMeta(el),
           })
           reportDirectWrite(result)
         }
@@ -301,33 +453,32 @@ function App() {
 
       // ── Text / link / button / fallback saves (existing text-search path) ──
 
-      type SavePair = { oldText: string; newText: string }
+      // Image/background edits must never go through the fuzzy text-search
+      // pipeline. If we got here, hasStyleProps is true (this is an image or
+      // background-image edit) but el.hbSourceFile/hbSourceLine is missing,
+      // so there is no reliable location to write to at all.
+      if (hasStyleProps) {
+        reportDirectWrite({
+          success: false,
+          error: 'No source location found for this image — cannot save to file.',
+        })
+        return
+      }
+
+      type SavePair = { oldText: string; newText: string; editKind: 'text' | 'href' }
       const saves: SavePair[] = []
 
-      function push(oldText: string | null | undefined, newText: string | undefined) {
+      function push(oldText: string | null | undefined, newText: string | undefined, editKind: 'text' | 'href') {
         if (newText === undefined) return
         const o = (oldText ?? '').trim()
         const n = newText.trim()
-        if (n && n !== o) saves.push({ oldText: o, newText: n })
+        if (n && n !== o) saves.push({ oldText: o, newText: n, editKind })
       }
 
-      push(el.textContent, patch.text)
-      push(el.href,        patch.href)
-      push(el.imageSrc,    patch.imageSrc)
-      push(el.imageAlt,    patch.imageAlt)
-      push(el.imageWidth,  patch.imageWidth)
-      push(el.imageHeight, patch.imageHeight)
-      // Fallback style saves (no source metadata)
-      push(el.computed.objectFit,          patch.objectFit)
-      push(el.computed.objectPosition,     patch.objectPosition)
-      push(el.computed.backgroundSize,     patch.backgroundSize)
-      push(el.computed.backgroundPosition, patch.backgroundPosition)
-      if (patch.backgroundImage !== undefined) {
-        const extractUrl = (v: string) => { const m = v.match(/url\(["']?([^"')]+)["']?\)/); return m ? m[1] : v }
-        push(extractUrl(el.computed.backgroundImage ?? ''), extractUrl(patch.backgroundImage))
-      }
+      push(el.textContent, patch.text, 'text')
+      push(el.href,        patch.href, 'href')
 
-      for (const { oldText, newText } of saves) {
+      for (const { oldText, newText, editKind } of saves) {
         if (!oldText || !newText) continue
         const result = await handleTextSaved({
           tagName:    el.tagName,
@@ -338,11 +489,12 @@ function App() {
           sourceCol:  el.hbSourceCol  ?? undefined,
           id:         el.id ?? undefined,
           classList:  el.classList,
+          editKind,
         })
         if (result === 'needs-confirmation') return
       }
     },
-    [handleTextSaved, reportDirectWrite]
+    [handleTextSaved, reportDirectWrite, project]
   )
 
   return (
@@ -364,7 +516,15 @@ function App() {
       locatorPayload={locatorPayload}
       hbDiagnostic={hbDiagnostic}
       hbDiagnosticError={hbDiagnosticError}
+      historyState={historyState}
+      historyNotice={historyNotice}
+      historyConflict={historyConflict}
       onOpenProject={openProject}
+      onUndo={undoHistory}
+      onRedo={redoHistory}
+      onDismissHistoryNotice={dismissHistoryNotice}
+      onDismissHistoryConflict={dismissHistoryConflict}
+      onDiscardConflictFileHistory={discardConflictFileHistory}
       onReload={() => window.api.reloadPreview()}
       onOpenInBrowser={() => window.api.openInBrowser()}
       onToggleInspect={handleToggleInspect}

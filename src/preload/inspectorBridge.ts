@@ -27,6 +27,10 @@ const state = {
   enabled:  false,
   hovered:  null as HTMLElement | null,
   selected: null as HTMLElement | null,
+  // Tracks which inline style properties the visual style editors last applied
+  // to the selected element, so switching Normal ↔ Hover (or Cancel) can cleanly
+  // clear properties that are no longer part of the current draft.
+  lastAppliedStyleProps: new Set<string>(),
 }
 
 function setOutline(el: HTMLElement, value: string): void {
@@ -74,6 +78,29 @@ function collectData(el: HTMLElement, resolvedFrom?: string | null) {
       backgroundSize: cs.backgroundSize,
       backgroundPosition: cs.backgroundPosition,
       transform: cs.transform,
+      fontFamily: cs.fontFamily,
+      fontWeight: cs.fontWeight,
+      lineHeight: cs.lineHeight,
+      letterSpacing: cs.letterSpacing,
+      textAlign: cs.textAlign,
+      textTransform: cs.textTransform,
+      textDecorationLine: cs.textDecorationLine,
+      borderTopWidth: cs.borderTopWidth,
+      borderStyle: cs.borderTopStyle,
+      borderColor: cs.borderTopColor,
+      borderTopLeftRadius: cs.borderTopLeftRadius,
+      borderTopRightRadius: cs.borderTopRightRadius,
+      borderBottomRightRadius: cs.borderBottomRightRadius,
+      borderBottomLeftRadius: cs.borderBottomLeftRadius,
+      width: cs.width,
+      minWidth: cs.minWidth,
+      height: cs.height,
+      display: cs.display,
+      justifyContent: cs.justifyContent,
+      alignItems: cs.alignItems,
+      opacity: cs.opacity,
+      boxShadow: cs.boxShadow,
+      transitionDuration: cs.transitionDuration,
     },
     href:      'href'      in el ? (a.getAttribute('href') ?? null) : null,
     linkTarget: el.tagName === 'A' ? (a.getAttribute('target') ?? null) : null,
@@ -94,6 +121,8 @@ function collectData(el: HTMLElement, resolvedFrom?: string | null) {
     hbItemId: el.getAttribute('data-hb-item-id') ?? null,
     // Set when the clicked element was resolved up to a closer ancestor (e.g. div → a)
     resolvedFrom: resolvedFrom ?? null,
+    // Stable per-element style class, once a hover style has been saved for this element.
+    hbStyleId: Array.from(el.classList).find((c) => /^hb-style-[a-z0-9]+$/.test(c))?.replace('hb-style-', '') ?? null,
   }
 }
 
@@ -246,6 +275,7 @@ function onClick(e: MouseEvent): void {
 
   log(`click on <${target.tagName.toLowerCase()}> → <${resolved.tagName.toLowerCase()}> [${reason}]`)
   clearSelected()
+  state.lastAppliedStyleProps.clear()
   state.selected = resolved
   setOutline(resolved, SELECT_OUTLINE)
   if (state.hovered === resolved) state.hovered = null
@@ -590,6 +620,8 @@ interface DomPatch {
   backgroundSize?: string
   backgroundPosition?: string
   transform?: string
+  styleProps?: Record<string, string>
+  clearStyleProps?: true
 }
 
 function applyDomPatch(patch: DomPatch): void {
@@ -623,6 +655,26 @@ function applyDomPatch(patch: DomPatch): void {
   if (patch.backgroundSize   !== undefined) el.style.backgroundSize   = patch.backgroundSize
   if (patch.backgroundPosition !== undefined) el.style.backgroundPosition = patch.backgroundPosition
   if (patch.transform        !== undefined) el.style.transform        = patch.transform
+
+  // Generic resolved style bag from the visual Button/Text style editors — one
+  // full snapshot per change. Clear any previously-applied key that's no longer
+  // present (e.g. switching Hover → Normal drops hover-only properties).
+  if (patch.clearStyleProps) {
+    for (const prop of state.lastAppliedStyleProps) {
+      (el.style as unknown as Record<string, string>)[prop] = ''
+    }
+    state.lastAppliedStyleProps.clear()
+  }
+  if (patch.styleProps) {
+    const nextKeys = new Set(Object.keys(patch.styleProps))
+    for (const prop of state.lastAppliedStyleProps) {
+      if (!nextKeys.has(prop)) (el.style as unknown as Record<string, string>)[prop] = ''
+    }
+    for (const [prop, value] of Object.entries(patch.styleProps)) {
+      (el.style as unknown as Record<string, string>)[prop] = value
+    }
+    state.lastAppliedStyleProps = nextKeys
+  }
 
   log(`applyDomPatch applied to <${el.tagName.toLowerCase()}>`)
   ipcRenderer.sendToHost('inspector:selected', collectData(el))

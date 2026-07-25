@@ -1,4 +1,4 @@
-import * as fs from 'fs'
+import { applySourceTransaction, MutateOutcome, HistoryEditType, HistoryElementMeta } from './sourceTransaction'
 
 // ─── public types ─────────────────────────────────────────────────────────────
 
@@ -7,6 +7,11 @@ export interface WriteInlineStyleParams {
   lineNumber: number        // 1-based, from hbSourceLine / _debugSource.lineNumber
   styleProps: Record<string, string>  // camelCase prop → raw CSS value (no surrounding quotes)
   tagName?: string          // e.g. 'div', 'img' — used to narrow the tag search
+  // history metadata — every writer records through the central transaction helper
+  projectPath: string
+  description: string
+  editType: HistoryEditType
+  element?: HistoryElementMeta
 }
 
 export interface WriteInlineStyleResult {
@@ -14,11 +19,13 @@ export interface WriteInlineStyleResult {
   filePath?: string
   lineNumber?: number
   error?: string
+  historyRecorded?: boolean
+  skippedReason?: string
 }
 
 // ─── utilities ────────────────────────────────────────────────────────────────
 
-function escapeRe(s: string): string {
+export function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
@@ -68,7 +75,7 @@ function findTagClose(content: string, pos: number): number {
  * `targetLine` (1-based) within a ±`radius` line search window.
  * Returns null if no tag can be located.
  */
-function findOpeningTagSpan(
+export function findOpeningTagSpan(
   content: string,
   targetLine: number,
   tagHint?: string,
@@ -135,7 +142,7 @@ function findOpeningTagSpan(
  * - no `style=` found
  * - the value is a variable reference like `style={hero}` (not an object literal)
  */
-function findStylePropSpan(tagContent: string): {
+export function findStylePropSpan(tagContent: string): {
   propStart: number
   propEnd: number
   bodyStart: number  // first char inside the {{ }}
@@ -185,7 +192,7 @@ function findStylePropSpan(tagContent: string): {
  * Handles single-quoted, double-quoted, and backtick string values, plus
  * unquoted values (numbers, identifiers, function calls like `scale(1.5)`).
  */
-function parseStyleBody(body: string): Map<string, string> {
+export function parseStyleBody(body: string): Map<string, string> {
   const result = new Map<string, string>()
   let i = 0
 
@@ -254,7 +261,7 @@ function quoteValue(v: string): string {
  * Serialise a style props Map to a single-line JSX `style` attribute string.
  * e.g. `style={{ backgroundSize: "150%", backgroundPosition: "50% 0%" }}`
  */
-function buildStyleAttr(props: Map<string, string>): string {
+export function buildStyleAttr(props: Map<string, string>): string {
   const entries = [...props.entries()]
     .filter(([, v]) => v !== '')
     .map(([k, v]) => `${k}: ${quoteValue(v)}`)
@@ -267,7 +274,7 @@ function buildStyleAttr(props: Map<string, string>): string {
  * `>` or `/>`, i.e. the correct place to insert a new attribute.
  * Returns -1 if not found.
  */
-function findInsertionPoint(tagContent: string): number {
+export function findInsertionPoint(tagContent: string): number {
   const last = tagContent.length - 1
   if (last < 0 || tagContent[last] !== '>') return -1
   // Self-closing: ends with '/>'
@@ -285,6 +292,10 @@ export interface WriteArrayItemPropParams {
   propName:  string
   /** The raw value to write (no surrounding quotes). Empty string = delete the prop. */
   propValue: string
+  projectPath: string
+  description: string
+  editType: HistoryEditType
+  element?: HistoryElementMeta
 }
 
 /**
@@ -299,15 +310,8 @@ export interface WriteArrayItemPropParams {
  * Note: brace counting does not skip string contents — values with `{`/`}` will
  * confuse the scanner. Portfolio-style flat object literals are safe.
  */
-export function writeArrayItemProp(params: WriteArrayItemPropParams): WriteInlineStyleResult {
+function computeArrayItemProp(content: string, params: WriteArrayItemPropParams): MutateOutcome {
   const { filePath, itemId, propName, propValue } = params
-
-  let content: string
-  try {
-    content = fs.readFileSync(filePath, 'utf-8')
-  } catch (err) {
-    return { success: false, error: `Cannot read ${filePath}: ${String(err)}` }
-  }
 
   // 1. Find itemId as a quoted string literal.
   const idPattern = new RegExp(`(['"])${escapeRe(itemId)}\\1`)
@@ -353,6 +357,7 @@ export function writeArrayItemProp(params: WriteArrayItemPropParams): WriteInlin
   const propPattern = new RegExp(`\\b${escapeRe(propName)}\\s*:`)
   const propMatch = propPattern.exec(objContent)
 
+  const writtenLine = content.slice(0, objOpenPos).split('\n').length
   let newContent: string
 
   if (propMatch) {
@@ -395,7 +400,7 @@ export function writeArrayItemProp(params: WriteArrayItemPropParams): WriteInlin
   } else {
     // Prop not found — insert before the closing '}'.
     if (propValue === '') {
-      return { success: true, filePath, lineNumber: content.slice(0, objOpenPos).split('\n').length }
+      return { success: true, lineNumber: writtenLine } // nothing to delete — no-op
     }
     // Derive indentation from the itemId line
     let lineStart = idPos
@@ -408,15 +413,22 @@ export function writeArrayItemProp(params: WriteArrayItemPropParams): WriteInlin
     newContent = content.slice(0, closingLineStart) + insertion + content.slice(closingLineStart)
   }
 
-  try {
-    fs.writeFileSync(filePath, newContent, 'utf-8')
-  } catch (err) {
-    return { success: false, error: `Cannot write ${filePath}: ${String(err)}` }
-  }
+  return { success: true, newContent, lineNumber: writtenLine }
+}
 
-  const writtenLine = content.slice(0, objOpenPos).split('\n').length
-  console.log(`[styleWriter] wrote array item prop "${propName}" for "${itemId}" in ${filePath}:${writtenLine}`)
-  return { success: true, filePath, lineNumber: writtenLine }
+export function writeArrayItemProp(params: WriteArrayItemPropParams): WriteInlineStyleResult {
+  const result = applySourceTransaction({
+    projectPath: params.projectPath,
+    filePath: params.filePath,
+    description: params.description,
+    editType: params.editType,
+    element: params.element,
+    mutate: (content) => computeArrayItemProp(content, params),
+  })
+  if (result.success && result.historyRecorded) {
+    console.log(`[styleWriter] wrote array item prop "${params.propName}" for "${params.itemId}" in ${params.filePath}:${result.lineNumber}`)
+  }
+  return result
 }
 
 // ─── array item text writer ───────────────────────────────────────────────────
@@ -429,6 +441,10 @@ export interface UpdateArrayItemTextParams {
   oldText:  string
   /** The replacement text. */
   newText:  string
+  projectPath: string
+  description: string
+  editType: HistoryEditType
+  element?: HistoryElementMeta
 }
 
 /**
@@ -443,15 +459,8 @@ export interface UpdateArrayItemTextParams {
  * Note: brace counting does not skip string contents; values containing `{`/`}`
  * will confuse the scanner (not a concern for typical flat data arrays).
  */
-export function updateArrayItemText(params: UpdateArrayItemTextParams): WriteInlineStyleResult {
+function computeArrayItemText(content: string, params: UpdateArrayItemTextParams): MutateOutcome {
   const { filePath, itemId, oldText, newText } = params
-
-  let content: string
-  try {
-    content = fs.readFileSync(filePath, 'utf-8')
-  } catch (err) {
-    return { success: false, error: `Cannot read ${filePath}: ${String(err)}` }
-  }
 
   // 1. Find itemId as a complete quoted string literal.
   const idPattern = new RegExp(`(['"])${escapeRe(itemId)}\\1`)
@@ -515,28 +524,29 @@ export function updateArrayItemText(params: UpdateArrayItemTextParams): WriteInl
     quoteChar + newText + quoteChar +
     content.slice(valueEnd)
 
-  try {
-    fs.writeFileSync(filePath, newContent, 'utf-8')
-  } catch (err) {
-    return { success: false, error: `Cannot write ${filePath}: ${String(err)}` }
-  }
-
   const writtenLine = content.slice(0, valueStart).split('\n').length
-  console.log(`[styleWriter] updated text for "${itemId}" → "${newText}" in ${filePath}:${writtenLine}`)
-  return { success: true, filePath, lineNumber: writtenLine }
+  return { success: true, newContent, lineNumber: writtenLine }
+}
+
+export function updateArrayItemText(params: UpdateArrayItemTextParams): WriteInlineStyleResult {
+  const result = applySourceTransaction({
+    projectPath: params.projectPath,
+    filePath: params.filePath,
+    description: params.description,
+    editType: params.editType,
+    element: params.element,
+    mutate: (content) => computeArrayItemText(content, params),
+  })
+  if (result.success && result.historyRecorded) {
+    console.log(`[styleWriter] updated text for "${params.itemId}" → "${params.newText}" in ${params.filePath}:${result.lineNumber}`)
+  }
+  return result
 }
 
 // ─── main export ─────────────────────────────────────────────────────────────
 
-export function writeInlineStyle(params: WriteInlineStyleParams): WriteInlineStyleResult {
+function computeInlineStyle(content: string, params: WriteInlineStyleParams): MutateOutcome {
   const { filePath, lineNumber, styleProps, tagName } = params
-
-  let content: string
-  try {
-    content = fs.readFileSync(filePath, 'utf-8')
-  } catch (err) {
-    return { success: false, error: `Cannot read ${filePath}: ${String(err)}` }
-  }
 
   const tagSpan = findOpeningTagSpan(content, lineNumber, tagName)
   if (!tagSpan) {
@@ -548,6 +558,7 @@ export function writeInlineStyle(params: WriteInlineStyleParams): WriteInlineSty
 
   const tagContent = content.slice(tagSpan.start, tagSpan.end)
   const styleSpan  = findStylePropSpan(tagContent)
+  const writtenLine = content.slice(0, tagSpan.start).split('\n').length
 
   let newTagContent: string
 
@@ -577,7 +588,7 @@ export function writeInlineStyle(params: WriteInlineStyleParams): WriteInlineSty
       if (v !== '') props.set(k, v)
     }
     if (props.size === 0) {
-      return { success: true, filePath, lineNumber }
+      return { success: true, lineNumber: writtenLine } // nothing to add — no-op
     }
 
     const insertAt = findInsertionPoint(tagContent)
@@ -593,13 +604,21 @@ export function writeInlineStyle(params: WriteInlineStyleParams): WriteInlineSty
   const newContent =
     content.slice(0, tagSpan.start) + newTagContent + content.slice(tagSpan.end)
 
-  try {
-    fs.writeFileSync(filePath, newContent, 'utf-8')
-  } catch (err) {
-    return { success: false, error: `Cannot write ${filePath}: ${String(err)}` }
-  }
+  return { success: true, newContent, lineNumber: writtenLine }
+}
 
-  const writtenLine = content.slice(0, tagSpan.start).split('\n').length
-  console.log(`[styleWriter] wrote inline style to ${filePath}:${writtenLine}`)
-  return { success: true, filePath, lineNumber: writtenLine }
+export function writeInlineStyle(params: WriteInlineStyleParams): WriteInlineStyleResult {
+  const result = applySourceTransaction({
+    projectPath: params.projectPath,
+    filePath: params.filePath,
+    description: params.description,
+    editType: params.editType,
+    sourceLine: params.lineNumber,
+    element: params.element,
+    mutate: (content) => computeInlineStyle(content, params),
+  })
+  if (result.success && result.historyRecorded) {
+    console.log(`[styleWriter] wrote inline style to ${params.filePath}:${result.lineNumber}`)
+  }
+  return result
 }

@@ -1,5 +1,6 @@
 import * as fs from 'fs'
 import * as path from 'path'
+import { applySourceTransaction, MutateOutcome, HistoryEditType, HistoryElementMeta } from './sourceTransaction'
 
 const SOURCE_EXTENSIONS = ['.html', '.htm', '.jsx', '.tsx', '.vue', '.svelte', '.astro', '.js', '.ts']
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'out', '.vite', 'build', 'release'])
@@ -69,6 +70,10 @@ export interface CommitParams {
   newText: string
   actualMatchText?: string
   matchOffset?: number
+  projectPath: string
+  description: string
+  editType: HistoryEditType
+  element?: HistoryElementMeta
 }
 
 export interface CommitResult {
@@ -79,6 +84,8 @@ export interface CommitResult {
   newText?: string
   bytesWritten?: number
   error?: string
+  historyRecorded?: boolean
+  skippedReason?: string
 }
 
 // ─── text normalisation ───────────────────────────────────────────────────────
@@ -442,8 +449,37 @@ export function analyzeLocatedEdit(params: LocatedEditParams): TextEditAnalysis 
   }
 }
 
+function computeTextEdit(original: string, params: CommitParams): MutateOutcome {
+  const { newText, actualMatchText, matchOffset, oldText } = params
+  const textToReplace = actualMatchText ?? oldText
+
+  let updated: string
+  let matchIdx: number
+
+  if (matchOffset !== undefined) {
+    const atOffset = original.slice(matchOffset, matchOffset + textToReplace.length)
+    if (atOffset !== textToReplace) {
+      return {
+        success: false,
+        error: `File changed since analysis — expected "${textToReplace.slice(0, 30)}" at offset ${matchOffset}`,
+      }
+    }
+    updated  = original.slice(0, matchOffset) + newText + original.slice(matchOffset + textToReplace.length)
+    matchIdx = matchOffset
+  } else {
+    matchIdx = original.indexOf(textToReplace)
+    if (matchIdx === -1) {
+      return { success: false, error: 'Text not found in file — file may have changed since analysis' }
+    }
+    updated = original.replace(textToReplace, newText)
+  }
+
+  const lineNumber = original.slice(0, matchIdx).split('\n').length
+  return { success: true, newContent: updated, lineNumber }
+}
+
 export function commitTextEdit(params: CommitParams): CommitResult {
-  const { filePath, oldText, newText, actualMatchText, matchOffset } = params
+  const { filePath, oldText, newText, actualMatchText, matchOffset, projectPath, description, editType, element } = params
   const textToReplace = actualMatchText ?? oldText
 
   console.log(
@@ -451,43 +487,32 @@ export function commitTextEdit(params: CommitParams): CommitResult {
     `in ${filePath}${matchOffset !== undefined ? ` @${matchOffset}` : ''}`
   )
 
-  try {
-    const original = fs.readFileSync(filePath, 'utf-8')
-    let updated: string
-    let matchIdx: number
+  const result = applySourceTransaction({
+    projectPath,
+    filePath,
+    description,
+    editType,
+    element,
+    mutate: (original) => computeTextEdit(original, params),
+  })
 
-    if (matchOffset !== undefined) {
-      const atOffset = original.slice(matchOffset, matchOffset + textToReplace.length)
-      if (atOffset !== textToReplace) {
-        return {
-          success: false, filePath, oldText, newText,
-          error: `File changed since analysis — expected "${textToReplace.slice(0, 30)}" at offset ${matchOffset}`
-        }
-      }
-      updated  = original.slice(0, matchOffset) + newText + original.slice(matchOffset + textToReplace.length)
-      matchIdx = matchOffset
-    } else {
-      matchIdx = original.indexOf(textToReplace)
-      if (matchIdx === -1) {
-        return {
-          success: false, filePath, oldText, newText,
-          error: 'Text not found in file — file may have changed since analysis'
-        }
-      }
-      updated = original.replace(textToReplace, newText)
-    }
+  if (!result.success) {
+    console.error('[commit] commitTextEdit failed:', result.error)
+    return { success: false, filePath, oldText, newText, error: result.error }
+  }
 
-    fs.writeFileSync(filePath, updated, 'utf-8')
+  let bytesWritten: number | undefined
+  try { bytesWritten = fs.statSync(filePath).size } catch { /* best-effort only */ }
 
-    const lineNumber    = original.slice(0, matchIdx).split('\n').length
-    const { size: bytesWritten } = fs.statSync(filePath)
-
-    console.log(`[commit] ✓ wrote ${filePath} line ${lineNumber} (${bytesWritten} bytes)`)
-    return { success: true, filePath, lineNumber, oldText, newText, bytesWritten }
-
-  } catch (err) {
-    const error = String(err)
-    console.error('[commit] commitTextEdit failed:', error)
-    return { success: false, filePath, oldText, newText, error }
+  console.log(`[commit] ✓ wrote ${filePath} line ${result.lineNumber} (${bytesWritten ?? '?'} bytes)`)
+  return {
+    success: true,
+    filePath: result.filePath,
+    lineNumber: result.lineNumber,
+    oldText,
+    newText,
+    bytesWritten,
+    historyRecorded: result.historyRecorded,
+    skippedReason: result.skippedReason,
   }
 }

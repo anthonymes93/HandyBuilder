@@ -1,8 +1,10 @@
 import type { RefObject } from 'react'
+import { FolderOpen, ExternalLink, X } from 'lucide-react'
 import {
   Project, FileNode, DevServerStatus, SelectedElement,
   TextEditPayload, TextEditAnalysis, SourceMatch, SaveStatus,
-  InspectorSavePatch, ImagePickResult, SaveResult, CommitResult, DomPatch, AstBinding
+  InspectorSavePatch, ImagePickResult, SaveResult, CommitResult, DomPatch, AstBinding,
+  HistoryState
 } from '../../types'
 import { Toolbar } from '../Toolbar/Toolbar'
 import { LeftSidebar } from '../LeftSidebar/LeftSidebar'
@@ -33,7 +35,15 @@ interface AppLayoutProps {
   locatorPayload: TextEditPayload | null
   hbDiagnostic: HbInjectionDiagnostic | null
   hbDiagnosticError: string | null
+  historyState: HistoryState
+  historyNotice: string | null
+  historyConflict: { kind: 'undo' | 'redo'; message: string; filePath: string } | null
   onOpenProject: () => void
+  onUndo: () => void
+  onRedo: () => void
+  onDismissHistoryNotice: () => void
+  onDismissHistoryConflict: () => void
+  onDiscardConflictFileHistory: () => void
   onReload: () => void
   onOpenInBrowser: () => void
   onToggleInspect: () => void
@@ -77,7 +87,15 @@ export function AppLayout({
   locatorPayload,
   hbDiagnostic,
   hbDiagnosticError,
+  historyState,
+  historyNotice,
+  historyConflict,
   onOpenProject,
+  onUndo,
+  onRedo,
+  onDismissHistoryNotice,
+  onDismissHistoryConflict,
+  onDiscardConflictFileHistory,
   onReload,
   onOpenInBrowser,
   onToggleInspect,
@@ -153,6 +171,7 @@ export function AppLayout({
         onInspectorSave={onInspectorSave}
         onPickFile={onPickFile}
         onLivePatch={onLivePatch}
+        onOpenFile={onOpenFile}
       />
     )
   }
@@ -165,11 +184,60 @@ export function AppLayout({
         devServerUrl={devServerUrl}
         isInspectMode={isInspectMode}
         saveStatus={saveStatus}
+        historyState={historyState}
+        onUndo={onUndo}
+        onRedo={onRedo}
         onReload={onReload}
         onOpenInBrowser={onOpenInBrowser}
         onToggleInspect={onToggleInspect}
         onCheckHbInjection={onCheckHbInjection}
       />
+
+      {historyConflict && (
+        <div className="shrink-0 px-4 py-2 bg-red-950/80 border-b border-red-900/60 flex items-center gap-3">
+          <span className="flex-1 min-w-0 text-xs text-red-200">
+            {historyConflict.message}
+          </span>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              onClick={() => onOpenFile(historyConflict.filePath)}
+              className="flex items-center gap-1 px-2 py-1 text-[11px] text-red-300 hover:text-red-100 hover:bg-red-900/40 rounded transition-colors"
+              title="Open in default editor"
+            >
+              <ExternalLink className="w-3 h-3" />
+              Open file
+            </button>
+            <button
+              onClick={onDiscardConflictFileHistory}
+              className="flex items-center gap-1 px-2 py-1 text-[11px] text-red-300 hover:text-red-100 hover:bg-red-900/40 rounded transition-colors"
+              title="Discard undo/redo history for this file"
+            >
+              <FolderOpen className="w-3 h-3" />
+              Discard history for this file
+            </button>
+            <button
+              onClick={onDismissHistoryConflict}
+              className="p-1 text-red-400/70 hover:text-red-200 rounded transition-colors"
+              title="Dismiss"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!historyConflict && historyNotice && (
+        <div className="shrink-0 px-4 py-2 bg-gray-900 border-b border-gray-800 flex items-center gap-3">
+          <span className="flex-1 min-w-0 text-xs text-gray-300">{historyNotice}</span>
+          <button
+            onClick={onDismissHistoryNotice}
+            className="p-1 text-gray-600 hover:text-gray-300 rounded transition-colors"
+            title="Dismiss"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       <SaveNotification
         saveResult={saveResult}
