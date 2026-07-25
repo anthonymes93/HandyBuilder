@@ -116,13 +116,37 @@ export interface HandyBuilderAPI {
   writeElementStyle: (params: {
     filePath: string
     lineNumber: number
+    colNumber?: number | null
     tagName?: string
+    textContent?: string | null
+    href?: string | null
+    classList?: string[]
     normalStyleProps: Record<string, string>
     hoverStyleProps?: Record<string, string>
     projectPath: string
     description: string
     element?: HistoryElementMeta
-  }) => Promise<WriteResult & { hoverPersisted?: boolean; hoverWarning?: string; styleId?: string }>
+    editScope?: 'instance' | 'shared'
+    scopeFilePath?: string
+    scopeLine?: number
+  }) => Promise<WriteResult & {
+    hoverPersisted?: boolean
+    hoverWarning?: string
+    styleId?: string
+    sharedComponentWarning?: string
+    needsScopeChoice?: {
+      componentName: string
+      instanceFilePath: string
+      instanceLine: number
+      sharedFilePath?: string
+      sharedLine?: number
+      sharedForwardsProps?: boolean
+    }
+    diagnostics?: {
+      reason: string
+      candidates: Array<{ tagName: string; line: number; col: number; confidence: number; textPreview: string; hrefPreview: string | null }>
+    }
+  }>
   openFileInEditor: (filePath: string) => Promise<{ success: true } | { error: string }>
   showInFolder: (filePath: string) => Promise<void>
 

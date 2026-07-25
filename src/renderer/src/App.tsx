@@ -4,7 +4,7 @@ import { useDevServer } from './hooks/useDevServer'
 import { useTextEdit, buildElementKey } from './hooks/useTextEdit'
 import { useEditHistory } from './hooks/useEditHistory'
 import { AppLayout } from './components/Layout/AppLayout'
-import { SelectedElement, InspectorSavePatch, ImagePickResult, TextEditPayload, SourceMatch, DomPatch, HistoryElementMeta } from './types'
+import { SelectedElement, InspectorSavePatch, ImagePickResult, TextEditPayload, SourceMatch, DomPatch, HistoryElementMeta, StyleScopeChoice } from './types'
 import type { PreviewFrameHandle } from './components/Preview/PreviewPanel'
 import type { HbInjectionDiagnostic } from './components/Preview/PreviewPanel'
 
@@ -62,6 +62,7 @@ function App() {
   const [locatorPayload, setLocatorPayload] = useState<TextEditPayload | null>(null)
   const [hbDiagnostic, setHbDiagnostic] = useState<HbInjectionDiagnostic | null>(null)
   const [hbDiagnosticError, setHbDiagnosticError] = useState<string | null>(null)
+  const [pendingScopeChoice, setPendingScopeChoice] = useState<{ patch: InspectorSavePatch; choice: StyleScopeChoice } | null>(null)
 
   const previewRef = useRef<PreviewFrameHandle>(null)
 
@@ -253,14 +254,41 @@ function App() {
         const result = await window.api.writeElementStyle({
           filePath: el.hbSourceFile,
           lineNumber: el.hbSourceLine,
+          colNumber: el.hbSourceCol ?? undefined,
           tagName: el.tagName,
+          textContent: el.textContent ?? undefined,
+          href: el.href ?? undefined,
+          classList: el.classList,
           normalStyleProps: (patch.styleNormal ?? {}) as Record<string, string>,
           hoverStyleProps: patch.styleHover as Record<string, string> | undefined,
           projectPath,
           description: patch.styleDescription ?? 'Changed element style',
           element: elementMeta(el),
+          editScope: patch.styleEditScope,
+          scopeFilePath: patch.styleScopeFilePath,
+          scopeLine: patch.styleScopeLine,
         })
+
+        if (result.needsScopeChoice) {
+          console.log('[app] writeElementStyle → needs scope choice', result.needsScopeChoice)
+          setPendingScopeChoice({ patch, choice: result.needsScopeChoice })
+          return
+        }
+
         if (result.hoverWarning) console.warn('[app] hover style warning:', result.hoverWarning)
+        if (result.sharedComponentWarning) console.warn('[app] shared component warning:', result.sharedComponentWarning)
+
+        if (!result.success && result.diagnostics) {
+          const top = result.diagnostics.candidates.slice(0, 3)
+            .map((c) => `<${c.tagName}> line ${c.line} (${c.confidence}%)`)
+            .join(', ')
+          reportDirectWrite({
+            success: false,
+            error: top ? `${result.error} — top candidates: ${top}` : result.error,
+          })
+          return
+        }
+
         reportDirectWrite(
           result.success
             ? { success: true, filePath: result.filePath, lineNumber: result.lineNumber }
@@ -497,6 +525,27 @@ function App() {
     [handleTextSaved, reportDirectWrite, project]
   )
 
+  // ── style-editor scope choice ("this button only" vs "all buttons using X") ─
+
+  const handleChooseScope = useCallback(
+    (scope: 'instance' | 'shared') => {
+      if (!pendingScopeChoice) return
+      const { patch, choice } = pendingScopeChoice
+      setPendingScopeChoice(null)
+      handleInspectorSave({
+        ...patch,
+        styleEditScope: scope,
+        styleScopeFilePath: scope === 'shared' ? choice.sharedFilePath : undefined,
+        styleScopeLine: scope === 'shared' ? choice.sharedLine : undefined,
+      })
+    },
+    [pendingScopeChoice, handleInspectorSave]
+  )
+
+  const handleCancelScopeChoice = useCallback(() => {
+    setPendingScopeChoice(null)
+  }, [])
+
   return (
     <AppLayout
       project={project}
@@ -519,6 +568,9 @@ function App() {
       historyState={historyState}
       historyNotice={historyNotice}
       historyConflict={historyConflict}
+      pendingScopeChoice={pendingScopeChoice?.choice ?? null}
+      onChooseScope={handleChooseScope}
+      onCancelScopeChoice={handleCancelScopeChoice}
       onOpenProject={openProject}
       onUndo={undoHistory}
       onRedo={redoHistory}

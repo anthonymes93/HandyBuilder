@@ -153,12 +153,19 @@ const api = {
   writeElementStyle: (params: {
     filePath: string
     lineNumber: number
+    colNumber?: number | null
     tagName?: string
+    textContent?: string | null
+    href?: string | null
+    classList?: string[]
     normalStyleProps: Record<string, string>
     hoverStyleProps?: Record<string, string>
     projectPath: string
     description: string
     element?: HistoryElementMeta
+    editScope?: 'instance' | 'shared'
+    scopeFilePath?: string
+    scopeLine?: number
   }) => ipcRenderer.invoke('editor:write-element-style', params),
 
   /** Open a file in the system default editor (e.g. VS Code). */

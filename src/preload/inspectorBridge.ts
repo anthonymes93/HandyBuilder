@@ -57,8 +57,13 @@ function collectData(el: HTMLElement, resolvedFrom?: string | null) {
 
   const isImg = el.tagName === 'IMG'
 
-  const { sourceFile, sourceLine, sourceCol, componentName } = getSourceInfo(el)
-  log(`[bridge] selected source info: file=${sourceFile ?? 'NONE'} line=${sourceLine ?? 'NONE'} component=${componentName ?? 'NONE'}`)
+  const {
+    sourceFile, sourceLine, sourceCol, sourceEndLine, sourceEndCol, sourceTag, componentName, origin,
+  } = getClosestSourceInfo(el)
+  log(
+    `[bridge] selected source info: file=${sourceFile ?? 'NONE'} line=${sourceLine ?? 'NONE'} ` +
+    `col=${sourceCol ?? 'NONE'} tag=${sourceTag ?? 'NONE'} component=${componentName ?? 'NONE'} origin=${origin ?? 'NONE'}`
+  )
 
   return {
     tagName:     el.tagName.toLowerCase(),
@@ -116,6 +121,10 @@ function collectData(el: HTMLElement, resolvedFrom?: string | null) {
     hbSourceFile:    sourceFile    ?? null,
     hbSourceLine:    sourceLine    ?? null,
     hbSourceCol:     sourceCol     ?? null,
+    hbSourceEndLine: sourceEndLine ?? null,
+    hbSourceEndCol:  sourceEndCol  ?? null,
+    hbSourceTag:     sourceTag     ?? null,
+    hbSourceOrigin:  origin        ?? null,
     hbComponentName: componentName ?? null,
     // Per-item identifier for mapped array elements (set via data-hb-item-id attribute)
     hbItemId: el.getAttribute('data-hb-item-id') ?? null,
@@ -304,24 +313,39 @@ interface SourceInfo {
   sourceFile?:     string
   sourceLine?:     number
   sourceCol?:      number
+  sourceEndLine?:  number
+  sourceEndCol?:   number
+  /** The literal JSX tag authored at this exact source position, e.g. "a" or "Button". */
+  sourceTag?:      string
   componentName?:  string
+  /** Where this metadata came from — surfaced to the user on save failures. */
+  origin?:         'direct' | 'parent' | 'fiber'
 }
 
-function getSourceInfo(el: HTMLElement): SourceInfo {
-  // ── try data-hb-* attributes first (injected by our Vite plugin) ──────────
-  const hbFile = el.getAttribute('data-hb-file')
-  const hbLine = el.getAttribute('data-hb-line')
-  if (hbFile) {
-    log(`[bridge] source via data-hb-*: ${hbFile}:${hbLine ?? '?'}`)
-    return {
-      sourceFile: hbFile,
-      sourceLine: hbLine ? parseInt(hbLine, 10) : undefined,
-    }
+/** Read the data-hb-* attribute set directly off one element. Null if unstamped. */
+function readHbAttrs(el: HTMLElement): Omit<SourceInfo, 'origin' | 'componentName'> | null {
+  const file = el.getAttribute('data-hb-file')
+  if (!file) return null
+  const num = (name: string): number | undefined => {
+    const v = el.getAttribute(name)
+    return v ? parseInt(v, 10) : undefined
   }
+  return {
+    sourceFile: file,
+    sourceLine: num('data-hb-line'),
+    sourceCol: num('data-hb-col'),
+    sourceEndLine: num('data-hb-end-line'),
+    sourceEndCol: num('data-hb-end-col'),
+    sourceTag: el.getAttribute('data-hb-tag') || undefined,
+  }
+}
 
-  // ── fall back to React fiber _debugSource ─────────────────────────────────
-  // @vitejs/plugin-react in dev mode asks Babel to include __source info on
-  // every JSX element; React stores it on fiber._debugSource = {fileName, lineNumber, columnNumber}.
+/**
+ * Fall back to React fiber _debugSource. @vitejs/plugin-react in dev mode asks
+ * Babel to include __source info on every JSX element; React stores it on
+ * fiber._debugSource = {fileName, lineNumber, columnNumber}.
+ */
+function getFiberSourceInfo(el: HTMLElement): SourceInfo {
   try {
     const fiberKey = Object.keys(el).find(
       (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')
@@ -352,7 +376,7 @@ function getSourceInfo(el: HTMLElement): SourceInfo {
           }
         } catch { /* ignore */ }
         log(`[bridge] source via fiber at depth ${depth}: ${src.fileName}:${src.lineNumber} owner=${componentName ?? 'unknown'}`)
-        return { sourceFile: src.fileName, sourceLine: src.lineNumber, sourceCol: src.columnNumber, componentName }
+        return { sourceFile: src.fileName, sourceLine: src.lineNumber, sourceCol: src.columnNumber, componentName, origin: 'fiber' }
       }
       fiber = (fiber.return as Record<string, unknown> | null)
       depth++
@@ -365,22 +389,25 @@ function getSourceInfo(el: HTMLElement): SourceInfo {
   return {}
 }
 
+/**
+ * Direct data-hb-* on `el`, else the NEAREST DOM ancestor's data-hb-* (marked
+ * origin: 'parent' so callers know the position may describe an ancestor's
+ * JSX, not the clicked element's own), else the fiber fallback.
+ */
 function getClosestSourceInfo(el: HTMLElement): SourceInfo {
-  let current: HTMLElement | null = el
+  const direct = readHbAttrs(el)
+  if (direct) return { ...direct, origin: 'direct' }
+
+  let current = el.parentElement
   while (current) {
-    const file = current.getAttribute('data-hb-file')
-    if (file) {
-      const line = current.getAttribute('data-hb-line')
-      const col = current.getAttribute('data-hb-col')
-      return {
-        sourceFile: file,
-        sourceLine: line ? parseInt(line, 10) : undefined,
-        sourceCol: col ? parseInt(col, 10) : undefined,
-      }
+    const parentAttrs = readHbAttrs(current)
+    if (parentAttrs) {
+      log(`[bridge] source via data-hb-* (parent): ${parentAttrs.sourceFile}:${parentAttrs.sourceLine} tag=${parentAttrs.sourceTag ?? '?'}`)
+      return { ...parentAttrs, origin: 'parent' }
     }
     current = current.parentElement
   }
-  return getSourceInfo(el)
+  return getFiberSourceInfo(el)
 }
 
 // ─── inline text editing ──────────────────────────────────────────────────────

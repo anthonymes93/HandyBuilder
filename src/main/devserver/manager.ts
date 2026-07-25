@@ -38,10 +38,23 @@ function babelHbPlugin({ types: t }) {
         const loc = p.node.loc
         if (!loc) return
         const file = state.filename || ''
+        // The literal JSX tag as authored at THIS exact opening element — e.g.
+        // "a" for an intrinsic element or "Button" for a component invocation.
+        // This is what lets the host tell apart "metadata points at the rendered
+        // DOM tag" from "metadata points at a wrapping component's usage site".
+        const nameNode = p.node.name
+        const tagName = t.isJSXIdentifier(nameNode)
+          ? nameNode.name
+          : t.isJSXMemberExpression(nameNode) && t.isJSXIdentifier(nameNode.property)
+            ? nameNode.property.name
+            : ''
         p.node.attributes.push(
           t.jsxAttribute(t.jsxIdentifier('data-hb-file'), t.stringLiteral(file)),
           t.jsxAttribute(t.jsxIdentifier('data-hb-line'), t.stringLiteral(String(loc.start.line))),
-          t.jsxAttribute(t.jsxIdentifier('data-hb-col'), t.stringLiteral(String(loc.start.column + 1)))
+          t.jsxAttribute(t.jsxIdentifier('data-hb-col'), t.stringLiteral(String(loc.start.column + 1))),
+          t.jsxAttribute(t.jsxIdentifier('data-hb-end-line'), t.stringLiteral(String(loc.end.line))),
+          t.jsxAttribute(t.jsxIdentifier('data-hb-end-col'), t.stringLiteral(String(loc.end.column + 1))),
+          t.jsxAttribute(t.jsxIdentifier('data-hb-tag'), t.stringLiteral(tagName))
         )
       }
     }

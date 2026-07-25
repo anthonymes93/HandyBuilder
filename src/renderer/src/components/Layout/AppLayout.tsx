@@ -4,7 +4,7 @@ import {
   Project, FileNode, DevServerStatus, SelectedElement,
   TextEditPayload, TextEditAnalysis, SourceMatch, SaveStatus,
   InspectorSavePatch, ImagePickResult, SaveResult, CommitResult, DomPatch, AstBinding,
-  HistoryState
+  HistoryState, StyleScopeChoice
 } from '../../types'
 import { Toolbar } from '../Toolbar/Toolbar'
 import { LeftSidebar } from '../LeftSidebar/LeftSidebar'
@@ -38,6 +38,9 @@ interface AppLayoutProps {
   historyState: HistoryState
   historyNotice: string | null
   historyConflict: { kind: 'undo' | 'redo'; message: string; filePath: string } | null
+  pendingScopeChoice: StyleScopeChoice | null
+  onChooseScope: (scope: 'instance' | 'shared') => void
+  onCancelScopeChoice: () => void
   onOpenProject: () => void
   onUndo: () => void
   onRedo: () => void
@@ -90,6 +93,9 @@ export function AppLayout({
   historyState,
   historyNotice,
   historyConflict,
+  pendingScopeChoice,
+  onChooseScope,
+  onCancelScopeChoice,
   onOpenProject,
   onUndo,
   onRedo,
@@ -295,6 +301,45 @@ export function AppLayout({
                 <div><p className="text-gray-500 mb-1">Body HTML sample (first 1000 chars):</p><pre className="whitespace-pre-wrap break-all rounded bg-gray-950 p-3">{hbDiagnostic.bodyHtmlSample}</pre></div>
               </div>
             )}
+          </div>
+        </div>
+      )}
+      {pendingScopeChoice && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6" onClick={onCancelScopeChoice}>
+          <div className="w-full max-w-md rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-sm font-semibold text-gray-100 mb-1">Apply style to:</h2>
+            <p className="text-xs text-gray-500 mb-4">
+              This button is rendered by the shared <span className="font-mono text-blue-400">&lt;{pendingScopeChoice.componentName}&gt;</span> component.
+            </p>
+            <div className="space-y-2">
+              <button
+                onClick={() => onChooseScope('instance')}
+                className="w-full text-left px-3 py-2.5 rounded border border-blue-600 bg-blue-950/40 hover:bg-blue-950/70 transition-colors"
+              >
+                <p className="text-sm text-blue-300 font-medium">This button only</p>
+                <p className="text-[11px] text-gray-500 mt-0.5">Adds a style to just this usage, in {pendingScopeChoice.instanceFilePath.split('/').pop()}.</p>
+              </button>
+              <button
+                onClick={() => onChooseScope('shared')}
+                disabled={!pendingScopeChoice.sharedFilePath}
+                className="w-full text-left px-3 py-2.5 rounded border border-gray-700 hover:border-gray-600 hover:bg-gray-800/60 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                <p className="text-sm text-gray-200 font-medium">
+                  All buttons using {pendingScopeChoice.componentName}.tsx
+                </p>
+                <p className="text-[11px] text-gray-500 mt-0.5">
+                  {pendingScopeChoice.sharedFilePath
+                    ? `Edits ${pendingScopeChoice.sharedFilePath.split('/').pop()} — affects every instance.`
+                    : "Couldn't locate the component's definition file."}
+                </p>
+              </button>
+            </div>
+            <button
+              onClick={onCancelScopeChoice}
+              className="w-full mt-3 px-3 py-1.5 text-xs text-gray-500 hover:text-gray-300 rounded border border-gray-800 hover:border-gray-700 transition-colors"
+            >
+              Cancel
+            </button>
           </div>
         </div>
       )}

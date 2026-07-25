@@ -161,6 +161,12 @@ export interface SelectedElement {
   hbSourceFile?:    string | null
   hbSourceLine?:    number | null
   hbSourceCol?:     number | null
+  hbSourceEndLine?: number | null
+  hbSourceEndCol?:  number | null
+  /** The literal JSX tag authored at hbSourceLine/hbSourceCol, e.g. "a" or "Button". */
+  hbSourceTag?:     string | null
+  /** Where hbSourceFile/Line came from: direct data-hb-* on this element, a parent's, or React fiber fallback. */
+  hbSourceOrigin?:  'direct' | 'parent' | 'fiber' | null
   hbComponentName?: string | null
   // Per-item identifier for elements inside .map() (from data-hb-item-id attribute)
   hbItemId?: string | null
@@ -358,6 +364,29 @@ export interface InspectorSavePatch {
   styleHover?: Partial<StyleProps>
   /** Human-readable history description, e.g. "Changed button style". */
   styleDescription?: string
+  /** Set once the user has answered the "this instance only" vs "shared component" prompt. */
+  styleEditScope?: 'instance' | 'shared'
+  styleScopeFilePath?: string
+  styleScopeLine?: number
+}
+
+/** Shown when a style Save targets a component invocation (e.g. <Button>) rather than an intrinsic tag. */
+export interface StyleScopeChoice {
+  componentName: string
+  instanceFilePath: string
+  instanceLine: number
+  sharedFilePath?: string
+  sharedLine?: number
+  sharedForwardsProps?: boolean
+}
+
+export interface StyleDiagnosticCandidate {
+  tagName: string
+  line: number
+  col: number
+  confidence: number
+  textPreview: string
+  hrefPreview: string | null
 }
 
 /** Returned by the image file-picker IPC call. */
