@@ -15,6 +15,29 @@ function log(msg: string): void {
   try { ipcRenderer.sendToHost('bridge:log', msg) } catch { /* ignore — host not ready yet */ }
 }
 
+// ─── document generation ───────────────────────────────────────────────────────
+// This preload script re-executes from scratch on every real navigation/full
+// reload (a fresh JS context — `documentGenerationId` is a new value each
+// time), but NOT on a React Fast Refresh HMR patch (same document, same
+// script instance, same id). The host uses a change in this id — not
+// webview lifecycle events alone — as the authoritative signal that a full
+// reload actually happened and it's now safe to restore against the new DOM.
+
+const documentGenerationId =
+  typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `gen-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+// Chromium's own scroll-position memory (bfcache/history-based) restores a
+// stale position on reload before our own restore logic ever runs, and can
+// fight it. We own scroll restoration entirely — turn the browser's off.
+try {
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
+} catch { /* ignore — history may not be accessible this early */ }
+
+ipcRenderer.sendToHost('bridge:ready', { documentGenerationId, href: window.location.href })
+log(`document generation ${documentGenerationId}`)
+
 // ─── outline constants ────────────────────────────────────────────────────────
 
 const HOVER_OUTLINE  = '2px dashed rgba(59, 130, 246, 0.75)'
@@ -999,6 +1022,208 @@ function patchHistory(): void {
   log('history patched for SPA route detection')
 }
 
+// ─── preview view-state capture / restore ─────────────────────────────────────
+// Save/Undo/Redo write a source file, which Vite's dev server picks up — often
+// as a genuine full-page reload (this preload script re-runs from scratch,
+// `state` resets) rather than a silent HMR patch. The host asks us to capture
+// scroll/selection just before writing, then repeatedly asks us to restore it
+// afterward (see PreviewPanel.tsx's retry loop) until it sticks or times out.
+
+interface CapturedViewState {
+  href: string
+  pathname: string
+  scrollX: number
+  scrollY: number
+  documentHeight: number
+  viewportHeight: number
+  /** Selected element's distance from the viewport top at capture time, so restore can reproduce its on-screen position (not just re-center it). */
+  elementViewportOffsetY: number | null
+  /** This document's generation id — the host stores it to detect a later full reload (a different id) vs. Fast Refresh (same id). */
+  documentGenerationId: string
+}
+
+function captureViewState(): CapturedViewState {
+  return {
+    href: window.location.href,
+    pathname: window.location.pathname,
+    scrollX: window.scrollX,
+    scrollY: window.scrollY,
+    documentHeight: document.documentElement.scrollHeight,
+    viewportHeight: window.innerHeight,
+    elementViewportOffsetY: state.selected ? state.selected.getBoundingClientRect().top : null,
+    documentGenerationId,
+  }
+}
+
+interface ElementIdentity {
+  hbStyleId?: string | null
+  sourceFile?: string | null
+  sourceLine?: number | null
+  sourceCol?: number | null
+  hbItemId?: string | null
+  id?: string | null
+  tagName?: string | null
+  classList?: string[]
+  textPreview?: string | null
+  href?: string | null
+}
+
+/** Priority 1 — the stable per-element class attached once a style has been saved for it. */
+function findByStyleId(id: string): HTMLElement | null {
+  const els = document.querySelectorAll<HTMLElement>('[class]')
+  for (const el of els) {
+    if (Array.from(el.classList).some((c) => c === `hb-style-${id}` || c === `hb-instance-${id}`)) return el
+  }
+  return null
+}
+
+/** Priority 2 — exact data-hb-file/line, with data-hb-col as a tiebreaker among same-line matches. */
+function findBySource(file: string, line: number, col?: number | null): HTMLElement | null {
+  const candidates = Array.from(document.querySelectorAll<HTMLElement>('[data-hb-file]')).filter(
+    (el) => el.getAttribute('data-hb-file') === file && Number(el.getAttribute('data-hb-line')) === line
+  )
+  if (candidates.length === 0) return null
+  if (candidates.length === 1 || col == null) return candidates[0]
+  return candidates.reduce((best, el) => {
+    const c  = Number(el.getAttribute('data-hb-col'))
+    const bc = Number(best.getAttribute('data-hb-col'))
+    return Math.abs(c - col) < Math.abs(bc - col) ? el : best
+  })
+}
+
+/** Priority 3 — mapped-array card identifier. */
+function findByItemId(itemId: string): HTMLElement | null {
+  try {
+    return document.querySelector<HTMLElement>(`[data-hb-item-id="${CSS.escape(itemId)}"]`)
+  } catch {
+    return null
+  }
+}
+
+/** Priority 5 — anchor matched by href + trimmed text content. */
+function findByHrefText(href: string, text: string): HTMLElement | null {
+  const norm = (s: string) => s.trim().replace(/\s+/g, ' ')
+  const wanted = norm(text)
+  const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))
+  return anchors.find((a) => a.getAttribute('href') === href && norm(a.textContent ?? '') === wanted) ?? null
+}
+
+/** Priority 6 — best-effort: same tag, scored by class overlap + exact text match. */
+function findByTagClassText(tagName: string, classList: string[], textPreview: string): HTMLElement | null {
+  const candidates = Array.from(document.getElementsByTagName(tagName)) as HTMLElement[]
+  const norm = (s: string) => s.trim().replace(/\s+/g, ' ').slice(0, 150)
+  const wanted = norm(textPreview)
+  let best: HTMLElement | null = null
+  let bestScore = 0
+  for (const el of candidates) {
+    const classes = el.classList
+    const overlap = classList.filter((c) => classes.contains(c)).length
+    const textMatch = wanted && norm(el.textContent ?? '') === wanted ? 5 : 0
+    const score = overlap + textMatch
+    if (score > bestScore) { bestScore = score; best = el }
+  }
+  return best
+}
+
+function findElementByIdentity(identity: ElementIdentity): { el: HTMLElement; method: string } | null {
+  if (identity.hbStyleId) {
+    const el = findByStyleId(identity.hbStyleId)
+    if (el) return { el, method: 'style-id' }
+  }
+  if (identity.sourceFile && identity.sourceLine != null) {
+    const el = findBySource(identity.sourceFile, identity.sourceLine, identity.sourceCol)
+    if (el) return { el, method: 'source' }
+  }
+  if (identity.hbItemId) {
+    const el = findByItemId(identity.hbItemId)
+    if (el) return { el, method: 'item-id' }
+  }
+  if (identity.id) {
+    const el = document.getElementById(identity.id)
+    if (el) return { el, method: 'id' }
+  }
+  if (identity.href && identity.textPreview) {
+    const el = findByHrefText(identity.href, identity.textPreview)
+    if (el) return { el, method: 'href-text' }
+  }
+  if (identity.tagName && identity.textPreview) {
+    const el = findByTagClassText(identity.tagName, identity.classList ?? [], identity.textPreview)
+    if (el) return { el, method: 'tag-class-text' }
+  }
+  return null
+}
+
+interface RestoreViewStateParams {
+  pathname: string
+  scrollX: number
+  scrollY: number
+  documentHeight: number
+  viewportHeight: number
+  elementViewportOffsetY: number | null
+  identity: ElementIdentity | null
+}
+
+function restoreViewState(target: RestoreViewStateParams): void {
+  // The document must actually be parsed before scrollIntoView/scroll math
+  // means anything — a request that arrives while still `loading` would
+  // silently "succeed" against a near-empty page. Tell the host to retry
+  // rather than reporting a false positive.
+  if (document.readyState === 'loading') {
+    log('[bridge] restoreViewState → document still loading, asking host to retry')
+    ipcRenderer.sendToHost('inspector:view-restored', {
+      success: false, method: 'not-ready', scrollY: window.scrollY, elementFound: false, documentGenerationId,
+    })
+    return
+  }
+
+  let method = 'none'
+  let elementFound = false
+  let restored = false
+
+  if (target.identity) {
+    const match = findElementByIdentity(target.identity)
+    if (match) {
+      const { el } = match
+      method = match.method
+      elementFound = true
+      el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })
+      if (target.elementViewportOffsetY != null) {
+        const delta = el.getBoundingClientRect().top - target.elementViewportOffsetY
+        if (Math.abs(delta) > 1) window.scrollBy(0, delta)
+      }
+      // Re-establish bridge selection state so subsequent live-patch edits
+      // (drag focal point, colour pickers, …) keep targeting the right node.
+      clearSelected()
+      state.selected = el
+      setOutline(el, SELECT_OUTLINE)
+      if (state.hovered === el) state.hovered = null
+      ipcRenderer.sendToHost('inspector:selected', collectData(el))
+      restored = true
+    }
+  }
+
+  if (!restored) {
+    // No identity, or the element genuinely isn't there anymore — fall back
+    // to absolute scroll position, else a proportional ratio (page length
+    // may have changed slightly, e.g. late-loading images).
+    const maxScroll = Math.max(1, document.documentElement.scrollHeight - window.innerHeight)
+    if (target.scrollY <= maxScroll + 4) {
+      window.scrollTo(target.scrollX, target.scrollY)
+      method = 'scroll-absolute'
+    } else {
+      const ratio = target.scrollY / Math.max(1, target.documentHeight - target.viewportHeight)
+      window.scrollTo(target.scrollX, Math.round(ratio * maxScroll))
+      method = 'scroll-ratio'
+    }
+    restored = Math.abs(window.scrollY - Math.min(target.scrollY, maxScroll)) < 40
+  }
+
+  log(`[bridge] restoreViewState → method=${method} elementFound=${elementFound} restored=${restored} scrollY=${window.scrollY} gen=${documentGenerationId}`)
+  ipcRenderer.sendToHost('inspector:view-restored', {
+    success: restored, method, scrollY: window.scrollY, elementFound, documentGenerationId,
+  })
+}
+
 // ─── IPC setup ────────────────────────────────────────────────────────────────
 
 function setup(): void {
@@ -1007,6 +1232,10 @@ function setup(): void {
   ipcRenderer.on('inspector:disable', () => { log('IPC → inspector:disable'); disable() })
   ipcRenderer.on('inspector:clear',   () => { clearHover(); clearSelected() })
   ipcRenderer.on('editor:apply-dom-patch', (_e, patch: DomPatch) => applyDomPatch(patch))
+  ipcRenderer.on('editor:capture-view-state', () => {
+    ipcRenderer.sendToHost('inspector:view-captured', captureViewState())
+  })
+  ipcRenderer.on('editor:restore-view-state', (_e, target: RestoreViewStateParams) => restoreViewState(target))
   patchHistory()
 }
 

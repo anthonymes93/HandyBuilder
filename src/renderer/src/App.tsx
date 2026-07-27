@@ -3,6 +3,7 @@ import { useProject } from './hooks/useProject'
 import { useDevServer } from './hooks/useDevServer'
 import { useTextEdit, buildElementKey } from './hooks/useTextEdit'
 import { useEditHistory } from './hooks/useEditHistory'
+import { usePreviewViewState } from './hooks/usePreviewViewState'
 import { AppLayout } from './components/Layout/AppLayout'
 import { SelectedElement, InspectorSavePatch, ImagePickResult, TextEditPayload, SourceMatch, DomPatch, HistoryElementMeta, StyleScopeChoice } from './types'
 import type { PreviewFrameHandle } from './components/Preview/PreviewPanel'
@@ -33,7 +34,7 @@ function App() {
     saveResult,
     pendingAnalysis,
     pendingAstBindings,
-    handleTextSaved,
+    handleTextSaved: handleTextSavedRaw,
     handleConfirmMatch,
     handleCancelConfirmation,
     handleConfirmAstBinding,
@@ -66,6 +67,23 @@ function App() {
 
   const previewRef = useRef<PreviewFrameHandle>(null)
 
+  // ── preview view-state (scroll/route/selection) preservation ───────────────
+  // Every save/undo/redo entry point captures before writing and restores
+  // after — see usePreviewViewState.ts for the capture→write→restore shape
+  // and PreviewPanel.tsx for the retry/ack mechanics.
+  const { captureViewState, restoreViewState, cancelPendingReload } = usePreviewViewState(previewRef)
+
+  const restoreAfterSave = useCallback(
+    async (viewState: Awaited<ReturnType<typeof captureViewState>>) => {
+      const ack = await restoreViewState(viewState)
+      // Retried the full ~1.5s budget and the element genuinely isn't there
+      // anymore (as opposed to the bridge never responding at all) — only
+      // then is it correct to close the Inspector.
+      if (ack && !ack.success && viewState?.identity) setSelectedElement(null)
+    },
+    [restoreViewState]
+  )
+
   useEffect(() => {
     window.api.getInspectorBridgePath().then(setBridgePath)
   }, [])
@@ -77,6 +95,23 @@ function App() {
   useEffect(() => {
     if (saveStatus === 'saved') refreshHistory()
   }, [saveStatus, saveResult, refreshHistory])
+
+  // Undo/Redo wrapped with view-state preservation — same capture → act →
+  // restore shape as saves. `undoHistory`/`redoHistory` themselves stay
+  // available unwrapped for the internal isolation-check rollback inside
+  // performInspectorSave (an automatic safety net mid-failing-save, not a
+  // user-initiated action — it shouldn't trigger its own capture/restore).
+  const handleUndo = useCallback(async () => {
+    const viewState = await captureViewState(selectedElement)
+    await undoHistory()
+    await restoreAfterSave(viewState)
+  }, [captureViewState, restoreAfterSave, undoHistory, selectedElement])
+
+  const handleRedo = useCallback(async () => {
+    const viewState = await captureViewState(selectedElement)
+    await redoHistory()
+    await restoreAfterSave(viewState)
+  }, [captureViewState, restoreAfterSave, redoHistory, selectedElement])
 
   // Keyboard shortcuts: Ctrl+Z (Undo), Ctrl+Shift+Z / Ctrl+Y (Redo).
   // Cmd on macOS. Ignored while typing in a text input/textarea/contenteditable
@@ -91,18 +126,18 @@ function App() {
 
       if (e.key.toLowerCase() === 'z' && e.shiftKey) {
         e.preventDefault()
-        redoHistory()
+        handleRedo()
       } else if (e.key.toLowerCase() === 'z') {
         e.preventDefault()
-        undoHistory()
+        handleUndo()
       } else if (e.key.toLowerCase() === 'y') {
         e.preventDefault()
-        redoHistory()
+        handleRedo()
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [undoHistory, redoHistory])
+  }, [handleUndo, handleRedo])
 
   const handleToggleInspect = useCallback(() => {
     setIsInspectMode((prev) => {
@@ -252,7 +287,7 @@ function App() {
 
   // ── inspector save ──────────────────────────────────────────────────────────
 
-  const handleInspectorSave = useCallback(
+  const performInspectorSave = useCallback(
     async (patch: InspectorSavePatch): Promise<boolean> => {
       const el = patch.element
       const projectPath = project?.path
@@ -686,7 +721,7 @@ function App() {
 
       for (const { oldText, newText, editKind } of saves) {
         if (!oldText || !newText) continue
-        const result = await handleTextSaved({
+        const result = await handleTextSavedRaw({
           tagName:    el.tagName,
           oldText,
           newText,
@@ -701,7 +736,34 @@ function App() {
       }
       return true
     },
-    [handleTextSaved, reportDirectWrite, project, waitForClassCount, waitForBackgroundVerified, undoHistory]
+    [handleTextSavedRaw, reportDirectWrite, project, waitForClassCount, waitForBackgroundVerified, undoHistory]
+  )
+
+  // Wraps performInspectorSave with view-state capture/restore — this is the
+  // one actually handed to the Inspector, keeping the save logic itself free
+  // of scroll/selection bookkeeping.
+  const handleInspectorSave = useCallback(
+    async (patch: InspectorSavePatch): Promise<boolean> => {
+      const viewState = await captureViewState(selectedElement)
+      const success = await performInspectorSave(patch)
+      if (success) await restoreAfterSave(viewState)
+      else cancelPendingReload() // nothing was written — no reload is coming, un-arm the guard
+      return success
+    },
+    [captureViewState, restoreAfterSave, cancelPendingReload, performInspectorSave, selectedElement]
+  )
+
+  // Wraps useTextEdit's handleTextSaved (used directly by the bridge's
+  // double-click inline-edit flow) the same way.
+  const handleTextSaved = useCallback(
+    async (payload: TextEditPayload) => {
+      const viewState = await captureViewState(selectedElement)
+      const status = await handleTextSavedRaw(payload)
+      if (status === 'saved') await restoreAfterSave(viewState)
+      else cancelPendingReload() // dom-only/needs-confirmation/failed — no file was written
+      return status
+    },
+    [captureViewState, restoreAfterSave, cancelPendingReload, handleTextSavedRaw, selectedElement]
   )
 
   // ── style-editor scope choice ("this button only" vs "all buttons using X") ─
@@ -751,8 +813,8 @@ function App() {
       onChooseScope={handleChooseScope}
       onCancelScopeChoice={handleCancelScopeChoice}
       onOpenProject={openProject}
-      onUndo={undoHistory}
-      onRedo={redoHistory}
+      onUndo={handleUndo}
+      onRedo={handleRedo}
       onDismissHistoryNotice={dismissHistoryNotice}
       onDismissHistoryConflict={dismissHistoryConflict}
       onDiscardConflictFileHistory={discardConflictFileHistory}

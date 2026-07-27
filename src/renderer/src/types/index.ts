@@ -234,9 +234,19 @@ export interface WebviewElement extends HTMLElement {
   addEventListener(event: 'ipc-message', listener: (e: IpcMessageEvent) => void): void
   addEventListener(event: 'dom-ready', listener: () => void): void
   addEventListener(event: 'did-start-loading', listener: () => void): void
+  addEventListener(event: 'did-stop-loading', listener: () => void): void
+  addEventListener(event: 'did-finish-load', listener: () => void): void
+  addEventListener(event: 'render-process-gone', listener: () => void): void
+  addEventListener(event: 'did-navigate', listener: () => void): void
+  addEventListener(event: 'did-navigate-in-page', listener: () => void): void
   removeEventListener(event: 'ipc-message', listener: (e: IpcMessageEvent) => void): void
   removeEventListener(event: 'dom-ready', listener: () => void): void
   removeEventListener(event: 'did-start-loading', listener: () => void): void
+  removeEventListener(event: 'did-stop-loading', listener: () => void): void
+  removeEventListener(event: 'did-finish-load', listener: () => void): void
+  removeEventListener(event: 'render-process-gone', listener: () => void): void
+  removeEventListener(event: 'did-navigate', listener: () => void): void
+  removeEventListener(event: 'did-navigate-in-page', listener: () => void): void
 }
 
 export interface IpcMessageEvent extends Event {

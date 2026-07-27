@@ -1,10 +1,61 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { Loader2 } from 'lucide-react'
 import {
   Project, DevServerStatus, SelectedElement,
   WebviewElement, IpcMessageEvent, TextEditPayload, DomPatch
 } from '../../types'
+import { ElementIdentity } from '../../utils/elementIdentity'
 import { WelcomeScreen } from './WelcomeScreen'
+
+/** Scroll/route facts captured from the webview, before identity is attached by usePreviewViewState. */
+export interface CapturedViewStateBase {
+  href: string
+  pathname: string
+  scrollX: number
+  scrollY: number
+  documentHeight: number
+  viewportHeight: number
+  elementViewportOffsetY: number | null
+  /** The bridge's document generation at capture time — compared after restore to tell a full reload (different id) apart from Fast Refresh (same id). */
+  documentGenerationId: string | null
+}
+
+export interface PreviewViewState extends CapturedViewStateBase {
+  identity: ElementIdentity | null
+  /** Short id used to correlate every log line / debug-panel update for one save/undo/redo across the whole capture→write→restore sequence. */
+  operationId: string
+}
+
+export interface RestoreAck {
+  success: boolean
+  method: string
+  scrollY: number
+  elementFound: boolean
+  documentGenerationId: string
+}
+
+/** Mirrors the bridge round-trip a restore actually goes through — surfaced only for the dev debug panel / console timeline. */
+export type PreviewReloadState =
+  | 'idle'
+  | 'save-started'
+  | 'waiting-for-reload'
+  | 'reload-started'
+  | 'dom-ready'
+  | 'reload-finished'
+  | 'restoring'
+  | 'restored'
+
+interface DebugSnapshot {
+  operationId: string
+  capturedGeneration: string | null
+  currentGeneration: string | null
+  reloadState: PreviewReloadState
+  capturedScrollY: number
+  currentScrollY: number | null
+  targetScrollY: number
+  elementFound: boolean | null
+  lastEvent: string
+}
 
 export interface PreviewFrameHandle {
   clearInspector: () => void
@@ -19,6 +70,26 @@ export interface PreviewFrameHandle {
    * (inconclusive — never used to fail a save on its own).
    */
   verifyBackgroundImage: (params: BackgroundVerifyParams) => Promise<boolean | null>
+  /** Snapshot scroll position + route from the live preview, before a source write. */
+  captureViewState: () => Promise<CapturedViewStateBase | null>
+  /**
+   * Re-apply a previously captured view state. Waits for an actual reload
+   * lifecycle signal (a NEW bridge document-generation id) rather than a
+   * blind timer before restoring against the replacement document; if no
+   * reload begins within ~2s it's treated as a Fast Refresh (same document)
+   * and restored against directly. Either way, corrects repeatedly for
+   * ~1.5s afterward to ride out late layout shifts. Safe/idempotent to call
+   * even when nothing moved.
+   */
+  restoreViewState: (state: PreviewViewState) => Promise<RestoreAck | null>
+  /**
+   * Mark whether the next `did-start-loading` is an EXPECTED save/undo/redo
+   * reload (selection must be preserved) vs. genuine user navigation, a
+   * manual Reload, or opening a different project (selection should clear).
+   * MUST be called before the source file is written — Vite's watcher can
+   * react before our own await chain would otherwise get to it.
+   */
+  setExpectingReload: (expecting: boolean, operationId?: string) => void
 }
 
 export interface BackgroundVerifyParams {
@@ -78,6 +149,58 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
     // Stable ref so dom-ready handler always sees latest mode without re-registering
     const isInspectModeRef = useRef(isInspectMode)
     isInspectModeRef.current = isInspectMode
+
+    // ── view-state capture/restore plumbing ─────────────────────────────────
+    // When true, the next did-start-loading is a reload WE caused by writing
+    // a source file (save/undo/redo) — selection must survive it. Genuine
+    // user navigation, a manual Reload click, or opening a different project
+    // leave this false, so onPageNavigated() still fires as before.
+    const expectingReloadRef = useRef(false)
+    const activeOperationIdRef = useRef<string | null>(null)
+    const pendingCaptureRef = useRef<((base: CapturedViewStateBase) => void) | null>(null)
+    const pendingRestoreRef = useRef<((ack: RestoreAck) => void) | null>(null)
+    // The current document's generation id, as last reported by bridge:ready
+    // (sent fresh by the preload script on every real navigation/reload, but
+    // NOT on a Fast Refresh HMR patch — same script instance, same id). This
+    // is the authoritative "did a full reload actually happen" signal.
+    const bridgeGenerationRef = useRef<string | null>(null)
+    // Resolved by onStartLoading — lets restoreViewState await "a reload
+    // actually began" instead of guessing from a fixed timer.
+    const reloadStartedWaiterRef = useRef<(() => void) | null>(null)
+    // Resolved by the bridge:ready handler once a generation DIFFERENT from
+    // the one being waited on arrives — i.e. the replacement document's
+    // bridge is alive and ready to receive a restore command.
+    const bridgeReadyWaiterRef = useRef<{ since: string | null; resolve: (gen: string) => void } | null>(null)
+    // Dev-only diagnostics — see the debug panel in the render below. Routed
+    // through a ref (rather than called directly) so the event-listener
+    // effect's closures — which don't re-create on every render — always
+    // reach the current setState function.
+    const debugRef = useRef<DebugSnapshot | null>(null)
+    const [debugSnapshot, setDebugSnapshot] = useState<DebugSnapshot | null>(null)
+    const debugSetterRef = useRef<((snap: DebugSnapshot | null) => void) | null>(null)
+    debugSetterRef.current = setDebugSnapshot
+
+    function updateDebug(patch: Partial<DebugSnapshot>): void {
+      if (!import.meta.env.DEV) return
+      const next: DebugSnapshot = {
+        operationId: debugRef.current?.operationId ?? '',
+        capturedGeneration: debugRef.current?.capturedGeneration ?? null,
+        currentGeneration: bridgeGenerationRef.current,
+        reloadState: debugRef.current?.reloadState ?? 'idle',
+        capturedScrollY: debugRef.current?.capturedScrollY ?? 0,
+        currentScrollY: debugRef.current?.currentScrollY ?? null,
+        targetScrollY: debugRef.current?.targetScrollY ?? 0,
+        elementFound: debugRef.current?.elementFound ?? null,
+        lastEvent: debugRef.current?.lastEvent ?? '',
+        ...patch,
+      }
+      debugRef.current = next
+      debugSetterRef.current?.(next)
+    }
+
+    function opLog(operationId: string, msg: string): void {
+      console.log(`[view-state ${operationId}] ${msg}`)
+    }
 
     useImperativeHandle(ref, () => ({
       clearInspector() {
@@ -164,6 +287,123 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
         } catch {
           return null
         }
+      },
+      setExpectingReload(expecting: boolean, operationId?: string) {
+        expectingReloadRef.current = expecting
+        activeOperationIdRef.current = expecting ? operationId ?? null : null
+        if (expecting && operationId) {
+          updateDebug({ operationId, reloadState: 'save-started', lastEvent: 'setExpectingReload(true)' })
+          opLog(operationId, `armed — expecting a possible reload (current gen=${bridgeGenerationRef.current ?? 'unknown'})`)
+        }
+      },
+      async captureViewState() {
+        const webview = webviewRef.current
+        if (!webview || !isReadyRef.current) return null
+        return new Promise<CapturedViewStateBase | null>((resolve) => {
+          pendingCaptureRef.current = (base) => resolve(base)
+          webview.send('editor:capture-view-state')
+          setTimeout(() => {
+            if (pendingCaptureRef.current) {
+              pendingCaptureRef.current = null
+              resolve(null)
+            }
+          }, 400)
+        })
+      },
+      async restoreViewState(target: PreviewViewState) {
+        const opId = target.operationId
+        const log = (msg: string) => opLog(opId, msg)
+        updateDebug({
+          operationId: opId,
+          capturedGeneration: target.documentGenerationId,
+          targetScrollY: target.scrollY,
+          capturedScrollY: target.scrollY,
+          reloadState: 'waiting-for-reload',
+          lastEvent: 'restore requested',
+        })
+        log(`restore requested — captured gen=${target.documentGenerationId ?? 'unknown'} scrollY=${target.scrollY}`)
+
+        // ── Step 1: did a real reload actually begin? A generation that has
+        // ALREADY changed by the time we get here means it happened before
+        // we could even start waiting — otherwise race did-start-loading
+        // against a ~2s "assume Fast Refresh" timeout. ──
+        let reloadBegan = !!target.documentGenerationId && bridgeGenerationRef.current !== target.documentGenerationId
+        if (!reloadBegan) {
+          reloadBegan = await new Promise<boolean>((resolve) => {
+            let done = false
+            reloadStartedWaiterRef.current = () => { if (!done) { done = true; resolve(true) } }
+            setTimeout(() => {
+              if (!done) { done = true; reloadStartedWaiterRef.current = null; resolve(false) }
+            }, 2000)
+          })
+        }
+
+        if (reloadBegan) {
+          log('did-start-loading observed (or generation already changed) — full-reload path')
+          updateDebug({ reloadState: 'reload-started', lastEvent: 'did-start-loading' })
+
+          if (bridgeGenerationRef.current === target.documentGenerationId) {
+            // Reload started but the replacement bridge hasn't reported in yet.
+            const newGeneration = await new Promise<string | null>((resolve) => {
+              let done = false
+              bridgeReadyWaiterRef.current = {
+                since: target.documentGenerationId,
+                resolve: (gen) => { if (!done) { done = true; resolve(gen) } },
+              }
+              setTimeout(() => {
+                if (!done) { done = true; bridgeReadyWaiterRef.current = null; resolve(null) }
+              }, 8000) // dev-server rebuilds can take a moment — generous on purpose
+            })
+            if (!newGeneration) {
+              log('timed out waiting for the new document\'s bridge — giving up on this attempt')
+              updateDebug({ reloadState: 'idle', lastEvent: 'gave up: no new bridge' })
+              return null
+            }
+            log(`new bridge ready gen=${newGeneration}`)
+          } else {
+            log(`generation already advanced to ${bridgeGenerationRef.current}`)
+          }
+          updateDebug({ reloadState: 'dom-ready', lastEvent: 'bridge:ready (new generation)' })
+        } else {
+          log('no did-start-loading within 2s — treating as Fast Refresh (same document)')
+        }
+
+        // ── Step 2: restore-attempt schedule against whatever is now the
+        // CURRENT document — either the confirmed replacement, or the same
+        // one if this was Fast Refresh. Never against the pre-reload document. ──
+        updateDebug({ reloadState: 'restoring', lastEvent: 'restore attempts starting' })
+        const schedule: Array<number | 'raf'> = [0, 'raf', 50, 150, 350, 750, 1250]
+        let lastAck: RestoreAck | null = null
+        for (const step of schedule) {
+          if (step === 'raf') await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+          else if (step > 0) await new Promise((resolve) => setTimeout(resolve, step))
+
+          const webview = webviewRef.current
+          if (!webview || !isReadyRef.current) {
+            log(`attempt @${step} — webview not ready yet, will retry`)
+            continue
+          }
+          lastAck = await new Promise<RestoreAck | null>((resolve) => {
+            pendingRestoreRef.current = (ack) => resolve(ack)
+            webview.send('editor:restore-view-state', target)
+            setTimeout(() => {
+              if (pendingRestoreRef.current) {
+                pendingRestoreRef.current = null
+                resolve(null)
+              }
+            }, 400)
+          })
+          log(`attempt @${step} → ${lastAck ? `success=${lastAck.success} method=${lastAck.method} scrollY=${lastAck.scrollY} elementFound=${lastAck.elementFound}` : 'no response'}`)
+          updateDebug({
+            currentScrollY: lastAck?.scrollY ?? null,
+            elementFound: lastAck?.elementFound ?? null,
+            lastEvent: `restore attempt @${step}`,
+          })
+          if (lastAck?.success) break
+        }
+        updateDebug({ reloadState: 'restored', lastEvent: 'restore sequence finished' })
+        log(`finished — ${lastAck?.success ? 'restored' : 'gave up'} (last ack: ${JSON.stringify(lastAck)})`)
+        return lastAck
       }
     }))
 
@@ -198,6 +438,28 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
           if (isInspectModeRef.current) {
             setTimeout(() => { webviewRef.current?.send('inspector:enable') }, 50)
           }
+        } else if (e.channel === 'inspector:view-captured') {
+          pendingCaptureRef.current?.(e.args[0] as CapturedViewStateBase)
+          pendingCaptureRef.current = null
+        } else if (e.channel === 'inspector:view-restored') {
+          pendingRestoreRef.current?.(e.args[0] as RestoreAck)
+          pendingRestoreRef.current = null
+        } else if (e.channel === 'bridge:ready') {
+          const { documentGenerationId, href } = e.args[0] as { documentGenerationId: string; href: string }
+          const previous = bridgeGenerationRef.current
+          bridgeGenerationRef.current = documentGenerationId
+          const opId = activeOperationIdRef.current
+          if (opId) opLog(opId, `bridge:ready gen=${documentGenerationId} href=${href} (previous gen=${previous ?? 'none'})`)
+          updateDebug({ currentGeneration: documentGenerationId, lastEvent: `bridge:ready gen=${documentGenerationId}` })
+          // A waiter is only listening for a generation DIFFERENT from the
+          // one it captured before the write — the very first bridge:ready
+          // after page load (or a same-generation Fast Refresh) must not
+          // satisfy it.
+          const waiter = bridgeReadyWaiterRef.current
+          if (waiter && documentGenerationId !== waiter.since) {
+            bridgeReadyWaiterRef.current = null
+            waiter.resolve(documentGenerationId)
+          }
         }
       },
       [onElementSelected, onTextSaved, onPageNavigated]
@@ -218,19 +480,49 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
         webview!.send(isInspectModeRef.current ? 'inspector:enable' : 'inspector:disable')
       }
 
+      function lifecycleLog(name: string) {
+        const opId = activeOperationIdRef.current
+        const line = `${name} url=${webview!.src ?? ''}`
+        if (opId) opLog(opId, line)
+        else console.log(`[preview] ${line}`)
+        updateDebug({ lastEvent: name })
+      }
+
       function onStartLoading() {
-        console.log('[preview] did-start-loading — clearing ready state')
+        const expected = expectingReloadRef.current
+        lifecycleLog(`did-start-loading${expected ? ' (expected save/undo/redo reload — preserving selection)' : ''}`)
         isReadyRef.current = false
-        onPageNavigated()
+        // Wake up any restoreViewState() waiting to learn whether a reload
+        // actually began, instead of it having to guess from a fixed timer.
+        reloadStartedWaiterRef.current?.()
+        reloadStartedWaiterRef.current = null
+        // A save/undo/redo-triggered reload must not be treated as user
+        // navigation — onPageNavigated() would null the selected element and
+        // unmount the Inspector's style editors, losing their local state
+        // (accordion/tab) right before we try to restore the same selection.
+        if (!expected) onPageNavigated()
+      }
+
+      function onDidStopLoading() {
+        lifecycleLog('did-stop-loading')
+      }
+
+      function onDidFinishLoad() {
+        lifecycleLog('did-finish-load')
+      }
+
+      function onRenderProcessGone() {
+        lifecycleLog('render-process-gone')
+        isReadyRef.current = false
       }
 
       function onDidNavigate() {
-        console.log('[preview] did-navigate — full navigation')
+        lifecycleLog('did-navigate — full navigation')
         isReadyRef.current = false
       }
 
       function onDidNavigateInPage() {
-        console.log('[preview] did-navigate-in-page — SPA navigation')
+        lifecycleLog('did-navigate-in-page — SPA navigation')
         // Bridge sends inspector:route-changed for the same event; this is a
         // safety net in case the bridge message is delayed or dropped.
         isReadyRef.current = true
@@ -242,6 +534,9 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
 
       webview.addEventListener('dom-ready', onDomReady)
       webview.addEventListener('did-start-loading', onStartLoading)
+      webview.addEventListener('did-stop-loading', onDidStopLoading)
+      webview.addEventListener('did-finish-load', onDidFinishLoad)
+      webview.addEventListener('render-process-gone', onRenderProcessGone)
       webview.addEventListener('did-navigate', onDidNavigate)
       webview.addEventListener('did-navigate-in-page', onDidNavigateInPage)
       webview.addEventListener('ipc-message', onIpcMessage)
@@ -249,6 +544,9 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
       return () => {
         webview.removeEventListener('dom-ready', onDomReady)
         webview.removeEventListener('did-start-loading', onStartLoading)
+        webview.removeEventListener('did-stop-loading', onDidStopLoading)
+        webview.removeEventListener('did-finish-load', onDidFinishLoad)
+        webview.removeEventListener('render-process-gone', onRenderProcessGone)
         webview.removeEventListener('did-navigate', onDidNavigate)
         webview.removeEventListener('did-navigate-in-page', onDidNavigateInPage)
         webview.removeEventListener('ipc-message', onIpcMessage)
@@ -275,7 +573,21 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
     }
 
     return (
-      <div className="flex-1 flex flex-col bg-gray-950 overflow-hidden">
+      <div className="relative flex-1 flex flex-col bg-gray-950 overflow-hidden">
+        {import.meta.env.DEV && debugSnapshot && (
+          <div className="absolute bottom-2 right-2 z-50 w-64 rounded border border-gray-700 bg-gray-950/95 p-2 font-mono text-[10px] leading-relaxed text-gray-300 shadow-lg pointer-events-none">
+            <div className="mb-1 text-gray-500">view-state debug</div>
+            <div>Operation: <span className="text-gray-100">{debugSnapshot.operationId || '—'}</span></div>
+            <div>Captured gen: <span className="text-gray-100">{debugSnapshot.capturedGeneration ?? '—'}</span></div>
+            <div>Current gen: <span className="text-gray-100">{debugSnapshot.currentGeneration ?? '—'}</span></div>
+            <div>Reload state: <span className="text-blue-300">{debugSnapshot.reloadState}</span></div>
+            <div>Captured scrollY: <span className="text-gray-100">{debugSnapshot.capturedScrollY}</span></div>
+            <div>Current scrollY: <span className="text-gray-100">{debugSnapshot.currentScrollY ?? '—'}</span></div>
+            <div>Target scrollY: <span className="text-gray-100">{debugSnapshot.targetScrollY}</span></div>
+            <div>Element found: <span className="text-gray-100">{debugSnapshot.elementFound === null ? '—' : debugSnapshot.elementFound ? 'yes' : 'no'}</span></div>
+            <div>Last event: <span className="text-gray-100">{debugSnapshot.lastEvent || '—'}</span></div>
+          </div>
+        )}
         <div className="h-8 flex items-center gap-2 px-3 bg-gray-900 border-b border-gray-800 shrink-0">
           <div className="w-2 h-2 rounded-full bg-green-500 shrink-0" />
           <span className="flex-1 min-w-0 bg-gray-800 rounded px-2 py-0.5 text-xs text-gray-400 font-mono truncate">

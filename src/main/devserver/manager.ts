@@ -148,7 +148,23 @@ try {
 
 console.log('[hb-config] Merging configs and starting dev server')
 export default mergeConfig(
-  defineConfig({ configFile: false, plugins: [hbSourcePlugin()] }),
+  defineConfig({
+    configFile: false,
+    plugins: [hbSourcePlugin()],
+    server: {
+      watch: {
+        // .handybuilder/history.json is rewritten by HandyBuilder on every
+        // single save/undo/redo, and the plugin/config files here are
+        // (re)written on project open. None of that is a source change —
+        // but it lives inside the watched project root, and Vite's default
+        // behaviour for a file change it can't map to a module in the graph
+        // is to fall back to a full page reload. Excluding this directory
+        // from the watcher is what makes ordinary edits hot-update via
+        // React Fast Refresh instead of reloading the whole page.
+        ignored: ['**/.handybuilder/**'],
+      },
+    },
+  }),
   userConfig
 )
 `
@@ -169,11 +185,21 @@ function isViteProject(projectPath: string): boolean {
   return VITE_CONFIG_NAMES.some((name) => fs.existsSync(path.join(projectPath, name)))
 }
 
+/** Write a generated file only if its content actually differs — skips a
+ * needless mtime bump (and, since these files are watched by Node/Vite's own
+ * config-file watcher, a needless dev-server restart) when nothing changed. */
+function writeIfChanged(filePath: string, content: string): void {
+  try {
+    if (fs.readFileSync(filePath, 'utf-8') === content) return
+  } catch { /* doesn't exist yet — fall through to write */ }
+  fs.writeFileSync(filePath, content, 'utf-8')
+}
+
 function writeHandyBuilderFiles(projectPath: string): void {
   const dir = path.join(projectPath, '.handybuilder')
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(path.join(dir, 'hb-source-plugin.mjs'), HB_PLUGIN_CODE, 'utf-8')
-  fs.writeFileSync(path.join(dir, 'vite.config.hb.mjs'),   HB_VITE_CONFIG_CODE, 'utf-8')
+  writeIfChanged(path.join(dir, 'hb-source-plugin.mjs'), HB_PLUGIN_CODE)
+  writeIfChanged(path.join(dir, 'vite.config.hb.mjs'),   HB_VITE_CONFIG_CODE)
 }
 
 const ANSI_RE = /\x1B\[[0-9;]*[a-zA-Z]/g
