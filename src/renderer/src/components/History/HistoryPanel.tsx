@@ -9,6 +9,7 @@ const TYPE_LABEL: Record<HistoryEditType, string> = {
   style: 'Style',
   'ast-binding': 'Text',
   'manual-edit': 'Manual',
+  delete: 'Delete',
 }
 
 function timeAgo(ts: number): string {

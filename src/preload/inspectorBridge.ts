@@ -40,9 +40,11 @@ log(`document generation ${documentGenerationId}`)
 
 // ─── outline constants ────────────────────────────────────────────────────────
 
-const HOVER_OUTLINE  = '2px dashed rgba(59, 130, 246, 0.75)'
-const SELECT_OUTLINE = '2px solid rgb(59, 130, 246)'
-const EDIT_OUTLINE   = '2px solid rgb(34, 197, 94)'
+const HOVER_OUTLINE   = '2px dashed rgba(59, 130, 246, 0.75)'
+const SELECT_OUTLINE  = '2px solid rgb(59, 130, 246)'
+const EDIT_OUTLINE    = '2px solid rgb(34, 197, 94)'
+/** Temporary outline shown while hovering a nested-element candidate in the delete submenu — distinct colour from selection/hover so it reads as "preview, not committed". */
+const PREVIEW_OUTLINE = '2px dashed rgb(245, 158, 11)'
 
 // ─── inspect state ────────────────────────────────────────────────────────────
 
@@ -62,6 +64,17 @@ const state = {
   // Client coordinates of the last click — reused by collectData() when it's
   // re-invoked without a fresh click (e.g. after an applyDomPatch echo).
   lastClickPoint: null as { x: number; y: number } | null,
+  // Nested-element deletion candidates from the most recent right-click/
+  // Delete-key request — short-lived, valid only until the next selection.
+  // Lets the host ask to preview/select one by id without re-resolving it.
+  deletionCandidateEls: new Map<string, HTMLElement>(),
+  previewOutlineEl: null as HTMLElement | null,
+  // The RAW deepest DOM node under the cursor for the most recent right-click
+  // — captured before resolveSelectTarget() runs, so a click on a nested icon
+  // never loses its own identity to the smart-promoted edit selection. This
+  // (not `selected`, which may already be the promoted ancestor) is what
+  // deletion candidate-building must start from.
+  lastContextMenuElement: null as HTMLElement | null,
 }
 
 function setOutline(el: HTMLElement, value: string): void {
@@ -889,9 +902,11 @@ function enable(): void {
   log('enabled — click/hover listeners attached')
   state.enabled = true
   document.body.style.cursor = 'crosshair'
-  document.addEventListener('click',     onClick,     true)
-  document.addEventListener('mouseover', onMouseOver, true)
-  document.addEventListener('mouseout',  onMouseOut,  true)
+  document.addEventListener('click',       onClick,       true)
+  document.addEventListener('mouseover',   onMouseOver,   true)
+  document.addEventListener('mouseout',    onMouseOut,    true)
+  document.addEventListener('contextmenu', onContextMenu, true)
+  document.addEventListener('keydown',     onDeleteKeyDown, true)
 }
 
 function disable(): void {
@@ -900,9 +915,11 @@ function disable(): void {
   if (editState.active) cancelEdit()
   state.enabled = false
   document.body.style.cursor = ''
-  document.removeEventListener('click',     onClick,     true)
-  document.removeEventListener('mouseover', onMouseOver, true)
-  document.removeEventListener('mouseout',  onMouseOut,  true)
+  document.removeEventListener('click',       onClick,       true)
+  document.removeEventListener('mouseover',   onMouseOver,   true)
+  document.removeEventListener('mouseout',    onMouseOut,    true)
+  document.removeEventListener('contextmenu', onContextMenu, true)
+  document.removeEventListener('keydown',     onDeleteKeyDown, true)
   clearHover()
   clearSelected()
   lastClickMs = 0
@@ -1224,6 +1241,527 @@ function restoreViewState(target: RestoreViewStateParams): void {
   })
 }
 
+// ─── element deletion — right-click context menu + Delete/Backspace ──────────
+
+export interface DeletionTargetPayload {
+  directFile: string | null
+  directLine: number | null
+  directCol: number | null
+  directTag: string | null
+  /**
+   * The nearest ANCESTOR composite-component's own invocation site (e.g. for
+   * a click landing on <ServiceCard>'s internal root <div>, this is where
+   * `<ServiceCard ... />` itself is written) — resolved via the React fiber
+   * tree, not data-hb-* attributes, since those never cross a non-prop-
+   * forwarding component boundary. Used by the writer to redirect deletion
+   * away from a shared component's own definition file.
+   */
+  ownerFile: string | null
+  ownerLine: number | null
+  ownerCol: number | null
+  ownerComponentName: string | null
+  /** Walked up from the clicked element — set only if the project's own JSX authors this attribute. */
+  hbItemId: string | null
+  /** 0-based position among all elements sharing the exact same direct file+line — the DOM-order fallback for identifying a mapped item when hbItemId isn't available. */
+  mappedIndex: number | null
+  mappedSiblingCount: number | null
+  isProtected: boolean
+  protectedReason: string | null
+  displayLabel: string
+  displaySource: string
+  /** Short labels for the deleted element's DOM siblings — what visibly stays behind. Empty when unknown/no DOM anchor. */
+  remainingSiblingLabels: string[]
+  /** Short label for the deleted element's DOM parent, when it's a real containing element (not <body>). */
+  remainingContainerLabel: string | null
+}
+
+interface OwnerInvocationInfo {
+  file: string | null
+  line: number | null
+  col: number | null
+  componentName: string | null
+}
+
+/**
+ * Walk the React fiber `.return` chain from `el` to find the nearest
+ * ANCESTOR composite-component fiber. A composite fiber's OWN `_debugSource`
+ * is where THAT component was invoked as JSX (e.g. `<ServiceCard />` in
+ * Services.tsx) — fundamentally different from `el`'s own `_debugSource`,
+ * which is wherever `el`'s tag is textually authored (possibly deep inside
+ * ServiceCard's own definition file). This is what lets deletion correctly
+ * target a reusable component's usage site instead of its shared definition.
+ */
+function getOwnerInvocationInfo(el: HTMLElement): OwnerInvocationInfo {
+  const none: OwnerInvocationInfo = { file: null, line: null, col: null, componentName: null }
+  try {
+    const fiberKey = Object.keys(el).find(
+      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')
+    )
+    if (!fiberKey) return none
+    let fiber = (el as unknown as Record<string, unknown>)[fiberKey] as Record<string, unknown> | null
+    let depth = 0
+    while (fiber && depth < 40) {
+      if (typeof fiber.type === 'function') {
+        const src = fiber._debugSource as { fileName?: string; lineNumber?: number; columnNumber?: number } | undefined
+        if (src?.fileName) {
+          const named = fiber.type as { displayName?: string; name?: string }
+          return {
+            file: src.fileName,
+            line: src.lineNumber ?? null,
+            col: src.columnNumber ?? null,
+            componentName: named.displayName ?? named.name ?? null,
+          }
+        }
+      }
+      fiber = fiber.return as Record<string, unknown> | null
+      depth++
+    }
+  } catch { /* ignore — fiber internals are not a stable API */ }
+  return none
+}
+
+/** 0-based position of `el` among all elements sharing the same data-hb-file + data-hb-line, in document order. */
+function getMappedIndexInfo(el: HTMLElement, file: string | null, line: number | null): { index: number | null; siblingCount: number | null } {
+  if (!file || line == null) return { index: null, siblingCount: null }
+  const all = Array.from(document.querySelectorAll<HTMLElement>('[data-hb-file][data-hb-line]')).filter(
+    (n) => n.getAttribute('data-hb-file') === file && n.getAttribute('data-hb-line') === String(line)
+  )
+  const index = all.indexOf(el)
+  return { index: index === -1 ? null : index, siblingCount: all.length }
+}
+
+function isProtectedElement(el: HTMLElement): { protected: boolean; reason: string | null } {
+  const tag = el.tagName
+  if (tag === 'HTML' || tag === 'HEAD' || tag === 'BODY') {
+    return { protected: true, reason: 'This structural element cannot be deleted safely.' }
+  }
+  // The React mount container (commonly #root, but fall back to "body's only
+  // child with no HandyBuilder source stamp at all" for other mount ids).
+  const mount = document.getElementById('root') || document.getElementById('app')
+  if (el === mount || (el.parentElement === document.body && !el.hasAttribute('data-hb-file') && !el.closest('[data-hb-file]'))) {
+    return { protected: true, reason: 'This structural element cannot be deleted safely.' }
+  }
+  return { protected: false, reason: null }
+}
+
+/** Short human-readable description of `el` for "what remains" messaging — not a source label, just enough to recognise it in the confirm dialog. */
+function describeShort(el: HTMLElement): string {
+  const tag = el.tagName.toLowerCase()
+  const text = (el.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 32)
+  if (tag === 'a') return text ? `"${text}" link` : 'link'
+  if (text) return `"${text}"`
+  return `<${tag}>`
+}
+
+/**
+ * What visibly stays behind if `el` were deleted right now — its DOM
+ * siblings (up to 4) and its immediate containing element, purely for the
+ * confirm dialog's "what remains" copy. Best-effort: returns empty/null when
+ * `el` has no parent (already detached) rather than guessing.
+ */
+function buildRemainsSummary(el: HTMLElement): { siblings: string[]; container: string | null } {
+  const parent = el.parentElement
+  if (!parent) return { siblings: [], container: null }
+  const siblings = Array.from(parent.children)
+    .filter((c): c is HTMLElement => c !== el && c instanceof HTMLElement)
+    .slice(0, 4)
+    .map(describeShort)
+  const container = parent !== document.body ? describeShort(parent) : null
+  return { siblings, container }
+}
+
+function buildDeletionTarget(el: HTMLElement): DeletionTargetPayload {
+  const direct = getClosestSourceInfo(el)
+  const owner = getOwnerInvocationInfo(el)
+  const mapped = getMappedIndexInfo(el, direct.sourceFile ?? null, direct.sourceLine ?? null)
+  const prot = isProtectedElement(el)
+  const remains = buildRemainsSummary(el)
+
+  let hbItemId: string | null = null
+  {
+    let node: HTMLElement | null = el
+    while (node) {
+      const id = node.getAttribute('data-hb-item-id')
+      if (id) { hbItemId = id; break }
+      node = node.parentElement
+    }
+  }
+
+  const tagLabel = el.tagName.toLowerCase()
+  const fileBase = direct.sourceFile ? direct.sourceFile.split('/').pop() : null
+  const displaySource = direct.sourceFile
+    ? `${fileBase}${direct.sourceLine ? `:${direct.sourceLine}` : ''}`
+    : 'unknown source'
+
+  return {
+    directFile: direct.sourceFile ?? null,
+    directLine: direct.sourceLine ?? null,
+    directCol: direct.sourceCol ?? null,
+    directTag: direct.sourceTag ?? tagLabel,
+    ownerFile: owner.file,
+    ownerLine: owner.line,
+    ownerCol: owner.col,
+    ownerComponentName: owner.componentName,
+    hbItemId,
+    mappedIndex: mapped.index,
+    mappedSiblingCount: mapped.siblingCount,
+    isProtected: prot.protected,
+    protectedReason: prot.reason,
+    displayLabel: `<${tagLabel}>`,
+    displaySource,
+    remainingSiblingLabels: remains.siblings,
+    remainingContainerLabel: remains.container,
+  }
+}
+
+// ─── nested-element deletion candidates ────────────────────────────────────
+// resolveSelectTarget()'s promotion (icon → wrapping <a>) is deliberately
+// kept as the DEFAULT selection/delete behaviour — it's what makes ordinary
+// clicking useful. This is an ADDITIONAL, explicit path: walk every fiber
+// from the exact clicked DOM node up to the page root, in render order, and
+// surface every level that safely maps to project source as a candidate the
+// user can pick directly — deepest first, exactly matching what's visually
+// nested inside what.
+
+export interface DeletionCandidatePayload {
+  candidateId: string
+  depth: number
+  kind: 'intrinsic-element' | 'component-instance'
+  displayLabel: string
+  target: DeletionTargetPayload
+}
+
+function labelForIntrinsic(el: HTMLElement, tagLabel: string): string {
+  const text = (el.textContent ?? '').trim().replace(/\s+/g, ' ')
+  if (el.tagName === 'A') {
+    const href = (el as HTMLAnchorElement).getAttribute('href')
+    if (text) return `<a> "${text.slice(0, 28)}"`
+    if (href) return `<a> (${href.slice(0, 24)})`
+    return '<a> link'
+  }
+  if (text) return `<${tagLabel}> "${text.slice(0, 28)}"`
+  return `<${tagLabel}>`
+}
+
+/**
+ * Walk the fiber tree from `clickedEl`'s own fiber upward via `.return`,
+ * collecting one candidate per safely-resolvable level:
+ *
+ *  - a HOST (intrinsic) fiber whose DOM node carries data-hb-file directly
+ *    (a plain tag authored in a project file) → 'intrinsic-element'.
+ *  - a COMPOSITE fiber (function/class/memo/forwardRef component) whose own
+ *    `_debugSource` is present AND not under node_modules → 'component-instance',
+ *    using that debug source as the invocation site directly (already
+ *    correct — no redirect needed, unlike the DOM-metadata path where a
+ *    non-forwarding component's own tag position can point at its
+ *    definition file instead of its usage site).
+ *
+ * A host fiber with NO data-hb-file (a `<path>`/`<svg>` from an icon
+ * library, or any other third-party-rendered DOM) and a composite fiber
+ * with NO `_debugSource` (its component wasn't compiled by this project's
+ * own dev pipeline — i.e. it's library code) are both silently skipped,
+ * never becoming a candidate and never risking a node_modules write.
+ */
+function buildDeletionCandidates(clickedEl: HTMLElement): DeletionCandidatePayload[] {
+  const candidates: DeletionCandidatePayload[] = []
+  state.deletionCandidateEls = new Map()
+
+  const fiberKey = Object.keys(clickedEl).find(
+    (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')
+  )
+  if (!fiberKey) return candidates
+
+  const seenKeys = new Set<string>()
+  let fiber = (clickedEl as unknown as Record<string, unknown>)[fiberKey] as Record<string, unknown> | null
+  let depth = 0
+  // Nearest real DOM element seen so far while walking upward. Updated on
+  // every host fiber with a live stateNode — including third-party ones
+  // without data-hb-file (e.g. a Lucide icon's inner <svg>/<path>) — so
+  // composite (component) candidates can anchor their preview outline /
+  // re-selection on it directly, instead of inferring from the candidates
+  // array, which interleaves host and composite entries and can point at
+  // a previously-pushed composite candidate rather than a real element.
+  let lastHostEl: HTMLElement = clickedEl
+
+  while (fiber && depth < 30 && candidates.length < 12) {
+    const type = fiber.type
+
+    if (typeof type === 'string') {
+      const stateNode = fiber.stateNode
+      if (stateNode instanceof HTMLElement) {
+        lastHostEl = stateNode
+      }
+      if (stateNode instanceof HTMLElement && stateNode.hasAttribute('data-hb-file')) {
+        const key = `${stateNode.getAttribute('data-hb-file')}:${stateNode.getAttribute('data-hb-line')}:${stateNode.getAttribute('data-hb-col')}`
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key)
+          const target = buildDeletionTarget(stateNode)
+          const candidateId = `cand-${candidates.length}`
+          state.deletionCandidateEls.set(candidateId, stateNode)
+          candidates.push({
+            candidateId,
+            depth,
+            kind: 'intrinsic-element',
+            displayLabel: labelForIntrinsic(stateNode, type),
+            target,
+          })
+          if (target.isProtected) break // nothing useful past html/head/body/root
+        }
+      }
+    } else if (typeof type === 'function' || (typeof type === 'object' && type !== null)) {
+      const src = fiber._debugSource as { fileName?: string; lineNumber?: number; columnNumber?: number } | undefined
+      if (src?.fileName && !src.fileName.includes('/node_modules/') && !src.fileName.includes('\\node_modules\\')) {
+        const named = type as { displayName?: string; name?: string }
+        const compName = named.displayName ?? named.name ?? null
+        if (compName) {
+          const key = `${src.fileName}:${src.lineNumber}:${src.columnNumber}`
+          if (!seenKeys.has(key)) {
+            seenKeys.add(key)
+            const fileBase = src.fileName.split('/').pop()
+            const candidateId = `cand-${candidates.length}`
+            // Component fibers have no single DOM node of their own — anchor
+            // the preview outline / re-selection on the nearest real element
+            // beneath it in the walk (the icon's rendered <svg>, etc.).
+            state.deletionCandidateEls.set(candidateId, lastHostEl)
+            const remains = buildRemainsSummary(lastHostEl)
+            candidates.push({
+              candidateId,
+              depth,
+              kind: 'component-instance',
+              displayLabel: compName,
+              target: {
+                directFile: src.fileName,
+                directLine: src.lineNumber ?? null,
+                directCol: src.columnNumber ?? null,
+                directTag: compName,
+                ownerFile: null,
+                ownerLine: null,
+                ownerCol: null,
+                ownerComponentName: null,
+                hbItemId: null,
+                mappedIndex: null,
+                mappedSiblingCount: null,
+                isProtected: false,
+                protectedReason: null,
+                displayLabel: compName,
+                displaySource: `${fileBase}${src.lineNumber ? `:${src.lineNumber}` : ''}`,
+                remainingSiblingLabels: remains.siblings,
+                remainingContainerLabel: remains.container,
+              },
+            })
+          }
+        }
+      }
+    }
+
+    fiber = fiber.return as Record<string, unknown> | null
+    depth++
+  }
+
+  return candidates
+}
+
+/** Outline a candidate for preview without changing the actual selection. `null` clears it. */
+function previewDeletionCandidate(candidateId: string | null): void {
+  if (state.previewOutlineEl) {
+    setOutline(state.previewOutlineEl, state.previewOutlineEl === state.selected ? SELECT_OUTLINE : '')
+    state.previewOutlineEl = null
+  }
+  if (!candidateId) return
+  const el = state.deletionCandidateEls.get(candidateId)
+  if (!el) return
+  state.previewOutlineEl = el
+  setOutline(el, PREVIEW_OUTLINE)
+}
+
+/** Make a candidate the actual selection and report its own fully-resolved deletion target — used when the user picks a "Delete parent" option from the submenu. */
+function selectDeletionCandidate(candidateId: string): void {
+  const el = state.deletionCandidateEls.get(candidateId)
+  if (!el) return
+
+  clearSelected()
+  state.selected = el
+  setOutline(el, SELECT_OUTLINE)
+  if (state.hovered === el) state.hovered = null
+  // Keep the destructive preview outline on the newly-chosen candidate — it
+  // carries into the confirm dialog that opens right after, same as the
+  // default (deepest-safe) candidate does.
+  previewDeletionCandidate(candidateId)
+
+  const selectedData = collectData(el)
+  ipcRenderer.sendToHost('inspector:selected', selectedData)
+  ipcRenderer.sendToHost('inspector:candidate-selected', {
+    selectedElement: selectedData,
+    deletionTarget: buildDeletionTarget(el),
+    fallbackIdentity: computeFallbackIdentity(el),
+  })
+}
+
+interface FallbackIdentity {
+  hbStyleId: string | null
+  sourceFile: string | null
+  sourceLine: number | null
+  sourceCol: number | null
+  hbItemId: string | null
+  id: string | null
+  tagName: string | null
+  classList: string[]
+  textPreview: string | null
+  href: string | null
+}
+
+/**
+ * Selection fallback order per the spec: next sibling → previous sibling →
+ * parent. Computed BEFORE deletion (while `el` still exists) so it can ride
+ * along in the same capture→write→restore flow every other save already
+ * uses — restoreViewState just gets handed this identity instead of the
+ * (now-gone) deleted element's own one.
+ */
+function computeFallbackIdentity(el: HTMLElement): FallbackIdentity | null {
+  const candidates = [el.nextElementSibling, el.previousElementSibling, el.parentElement]
+  for (const c of candidates) {
+    if (!(c instanceof HTMLElement)) continue
+    let node: HTMLElement | null = c
+    while (node && node !== document.documentElement) {
+      const attrs = readHbAttrs(node)
+      if (attrs) {
+        return {
+          hbStyleId: Array.from(node.classList).find((cl) => /^hb-(style|instance)-[a-z0-9]+$/.test(cl))?.replace(/^hb-(style|instance)-/, '') ?? null,
+          sourceFile: attrs.sourceFile ?? null,
+          sourceLine: attrs.sourceLine ?? null,
+          sourceCol: attrs.sourceCol ?? null,
+          hbItemId: node.getAttribute('data-hb-item-id') ?? null,
+          id: node.id || null,
+          tagName: node.tagName.toLowerCase(),
+          classList: Array.from(node.classList),
+          textPreview: (node.textContent ?? '').trim().slice(0, 150) || null,
+          href: node instanceof HTMLAnchorElement ? node.getAttribute('href') : null,
+        }
+      }
+      node = node.parentElement
+    }
+  }
+  return null
+}
+
+/**
+ * The deepest DOM element actually under the cursor, independent of
+ * `resolveSelectTarget()`'s ancestor promotion. Prefers `composedPath()`
+ * (survives shadow-DOM boundaries `e.target` can collapse across),
+ * falls back to `e.target`, then to `elementFromPoint` as a last resort.
+ */
+function getRawClickedElement(e: MouseEvent): HTMLElement | null {
+  if (typeof e.composedPath === 'function') {
+    const first = e.composedPath().find((n): n is HTMLElement => n instanceof HTMLElement)
+    if (first) return first
+  }
+  if (e.target instanceof HTMLElement) return e.target
+  const atPoint = document.elementFromPoint(e.clientX, e.clientY)
+  return atPoint instanceof HTMLElement ? atPoint : null
+}
+
+/** First candidate (deepest-first order) that's safe to delete outright: not protected, and its source is actually known. */
+function chooseActiveCandidate(candidates: DeletionCandidatePayload[]): DeletionCandidatePayload | null {
+  return candidates.find((c) => !c.target.isProtected && !!c.target.directFile) ?? null
+}
+
+function onContextMenu(e: MouseEvent): void {
+  if (!state.enabled) return // never show HandyBuilder's menu with Inspect mode off
+  if (editState.active) return
+  e.preventDefault()
+  e.stopPropagation()
+
+  // Captured BEFORE any smart-selection promotion runs — this, not the
+  // promoted edit target, is what deletion candidate-building starts from.
+  const clickedElement = getRawClickedElement(e)
+  if (!clickedElement) return
+  state.lastContextMenuElement = clickedElement
+
+  // Smart-resolved target — still drives the ordinary blue Inspector
+  // selection highlight, exactly like a left click would. It is NOT used to
+  // seed deletion candidates anymore; that's the bug this fixes.
+  const { el: resolved, resolvedFrom } = resolveSelectTarget(clickedElement)
+
+  clearSelected()
+  state.lastAppliedStyleProps.clear()
+  state.selected = resolved
+  state.lastClickPoint = { x: e.clientX, y: e.clientY }
+  setOutline(resolved, SELECT_OUTLINE)
+  if (state.hovered === resolved) state.hovered = null
+
+  const candidates = buildDeletionCandidates(clickedElement)
+  const active = chooseActiveCandidate(candidates)
+  const activeEl = active ? state.deletionCandidateEls.get(active.candidateId) ?? resolved : resolved
+  const activeTarget = active ? active.target : buildDeletionTarget(resolved)
+
+  // Show the destructive preview outline on the actual default deletion
+  // target immediately — the user shouldn't have to hover a submenu to see
+  // what "Delete" is about to remove.
+  previewDeletionCandidate(active?.candidateId ?? null)
+
+  // ── diagnostics ──────────────────────────────────────────────────────────
+  log(`[delete-target] raw event target: ${describeEl(e.target as HTMLElement)}`)
+  if (typeof e.composedPath === 'function') {
+    const pathLabels = e.composedPath()
+      .filter((n): n is HTMLElement => n instanceof HTMLElement)
+      .slice(0, 8)
+      .map(describeEl)
+    log(`[delete-target] composed path: ${pathLabels.join(' → ')}`)
+  }
+  log(`[delete-target] smart edit target: ${describeEl(resolved)}`)
+  candidates.forEach((c, i) => {
+    const safe = !c.target.isProtected && !!c.target.directFile
+    log(`[delete-target] ${i} ${c.displayLabel} — ${safe ? 'safe' : 'unsafe'} — ${c.target.displaySource}`)
+  })
+  if (active) {
+    log(`[delete-target] active delete candidate: ${active.displayLabel} — ${active.target.displaySource}`)
+  } else {
+    log(`[delete-target] no safe nested candidate resolved — falling back to smart target ${describeEl(resolved)} (reason: ${candidates.length === 0 ? 'no candidates built (no fiber found)' : 'every candidate was protected or had no known source'})`)
+  }
+
+  const selectedData = collectData(resolved, resolvedFrom, state.lastClickPoint)
+  ipcRenderer.sendToHost('inspector:selected', selectedData)
+  ipcRenderer.sendToHost('inspector:context-menu', {
+    clientX: e.clientX,
+    clientY: e.clientY,
+    selectedElement: selectedData,
+    // The DEFAULT deletion target is now the deepest safe candidate, not the
+    // smart-promoted `resolved` element — right-clicking the icon inside
+    // `<a className="logo"><LeafIcon/><span>...</span></a>` must default to
+    // deleting the icon, never the whole link.
+    deletionTarget: activeTarget,
+    activeCandidateId: active?.candidateId ?? null,
+    fallbackIdentity: computeFallbackIdentity(activeEl),
+    // Full deepest-to-outermost chain, built from the exact clicked node —
+    // the UI derives "Delete parent ▸" options from whatever comes after
+    // the active candidate in this list.
+    deletionCandidates: candidates,
+  })
+}
+
+/** Delete/Backspace while an element is selected and Inspect mode is active — goes straight to the confirm dialog (no menu step). */
+function onDeleteKeyDown(e: KeyboardEvent): void {
+  if (!state.enabled) return
+  if (editState.active) return
+  if (!state.selected) return
+  if (e.key !== 'Delete' && e.key !== 'Backspace') return
+
+  const activeEl = document.activeElement as HTMLElement | null
+  if (activeEl) {
+    const tag = activeEl.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || activeEl.isContentEditable) return
+  }
+
+  e.preventDefault()
+  const selectedData = collectData(state.selected)
+  ipcRenderer.sendToHost('inspector:delete-requested', {
+    selectedElement: selectedData,
+    deletionTarget: buildDeletionTarget(state.selected),
+    fallbackIdentity: computeFallbackIdentity(state.selected),
+    deletionCandidates: buildDeletionCandidates(state.selected),
+  })
+}
+
 // ─── IPC setup ────────────────────────────────────────────────────────────────
 
 function setup(): void {
@@ -1236,6 +1774,8 @@ function setup(): void {
     ipcRenderer.sendToHost('inspector:view-captured', captureViewState())
   })
   ipcRenderer.on('editor:restore-view-state', (_e, target: RestoreViewStateParams) => restoreViewState(target))
+  ipcRenderer.on('editor:preview-candidate', (_e, candidateId: string | null) => previewDeletionCandidate(candidateId))
+  ipcRenderer.on('editor:select-candidate', (_e, candidateId: string) => selectDeletionCandidate(candidateId))
   patchHistory()
 }
 

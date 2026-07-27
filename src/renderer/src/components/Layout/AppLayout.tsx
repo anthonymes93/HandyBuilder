@@ -4,7 +4,7 @@ import {
   Project, FileNode, DevServerStatus, SelectedElement,
   TextEditPayload, TextEditAnalysis, SourceMatch, SaveStatus,
   InspectorSavePatch, ImagePickResult, SaveResult, CommitResult, DomPatch, AstBinding,
-  HistoryState, StyleScopeChoice
+  HistoryState, StyleScopeChoice, DeletionTarget, ElementIdentityLike
 } from '../../types'
 import { Toolbar } from '../Toolbar/Toolbar'
 import { LeftSidebar } from '../LeftSidebar/LeftSidebar'
@@ -56,6 +56,7 @@ interface AppLayoutProps {
   onClearSelection: () => void
   onPageNavigated: () => void
   onTextSaved: (payload: TextEditPayload) => void
+  onDeleteElement: (target: DeletionTarget, fallbackIdentity: ElementIdentityLike | null, operationId: string) => Promise<{ success: boolean; error?: string }>
   onConfirmMatch: (match: SourceMatch) => void
   onCancelConfirmation: () => void
   onConfirmAstBinding: (binding: AstBinding) => void
@@ -111,6 +112,7 @@ export function AppLayout({
   onClearSelection,
   onPageNavigated,
   onTextSaved,
+  onDeleteElement,
   onConfirmMatch,
   onCancelConfirmation,
   onConfirmAstBinding,
@@ -278,6 +280,7 @@ export function AppLayout({
           onElementSelected={onElementSelected}
           onPageNavigated={onPageNavigated}
           onTextSaved={onTextSaved}
+          onDeleteElement={onDeleteElement}
         />
         {rightPanel()}
       </div>

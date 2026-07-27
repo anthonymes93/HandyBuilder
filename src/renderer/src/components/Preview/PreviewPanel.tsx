@@ -2,10 +2,14 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useSta
 import { Loader2 } from 'lucide-react'
 import {
   Project, DevServerStatus, SelectedElement,
-  WebviewElement, IpcMessageEvent, TextEditPayload, DomPatch
+  WebviewElement, IpcMessageEvent, TextEditPayload, DomPatch,
+  DeletionTarget, ElementContextMenuRequest, DeleteKeyRequest, ElementIdentityLike,
+  DeletionCandidate, CandidateSelectedMessage
 } from '../../types'
 import { ElementIdentity } from '../../utils/elementIdentity'
 import { WelcomeScreen } from './WelcomeScreen'
+import { ElementContextMenu } from '../Inspector/ElementContextMenu'
+import { DeleteConfirmDialog } from '../Inspector/DeleteConfirmDialog'
 
 /** Scroll/route facts captured from the webview, before identity is attached by usePreviewViewState. */
 export interface CapturedViewStateBase {
@@ -129,6 +133,8 @@ interface PreviewPanelProps {
   onElementSelected: (el: SelectedElement) => void
   onPageNavigated: () => void
   onTextSaved: (payload: TextEditPayload) => void
+  /** Runs the actual AST deletion (+ view-state preservation); resolves once the write (and, on success, restoration) is complete. */
+  onDeleteElement: (target: DeletionTarget, fallbackIdentity: ElementIdentityLike | null, operationId: string) => Promise<{ success: boolean; error?: string }>
 }
 
 const LOADING_MESSAGES: Partial<Record<DevServerStatus, string>> = {
@@ -141,7 +147,7 @@ const LOADING_MESSAGES: Partial<Record<DevServerStatus, string>> = {
 
 export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
   function PreviewPanel(
-    { url, status, project, isInspectMode, bridgePath, onElementSelected, onPageNavigated, onTextSaved },
+    { url, status, project, isInspectMode, bridgePath, onElementSelected, onPageNavigated, onTextSaved, onDeleteElement },
     ref
   ) {
     const webviewRef = useRef<WebviewElement>(null)
@@ -179,6 +185,56 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
     const [debugSnapshot, setDebugSnapshot] = useState<DebugSnapshot | null>(null)
     const debugSetterRef = useRef<((snap: DebugSnapshot | null) => void) | null>(null)
     debugSetterRef.current = setDebugSnapshot
+
+    // ── right-click context menu / delete confirm ───────────────────────────
+    const [contextMenu, setContextMenu] = useState<{
+      x: number; y: number; target: DeletionTarget; fallbackIdentity: ElementIdentityLike | null
+      candidates: DeletionCandidate[]; activeCandidateId: string | null
+    } | null>(null)
+    const [deleteConfirm, setDeleteConfirm] = useState<{
+      target: DeletionTarget; fallbackIdentity: ElementIdentityLike | null
+    } | null>(null)
+    const [deleteBusy, setDeleteBusy] = useState(false)
+    const [deleteError, setDeleteError] = useState<string | null>(null)
+    const containerRef = useRef<HTMLDivElement>(null)
+
+    /** Guest-page (webview-relative) clientX/Y → coordinates relative to this component's own positioned container, so the menu/dialog can be absolutely positioned over the webview correctly. */
+    function toContainerCoords(clientX: number, clientY: number): { x: number; y: number } {
+      const webview = webviewRef.current
+      const container = containerRef.current
+      if (!webview || !container) return { x: clientX, y: clientY }
+      const webviewRect = webview.getBoundingClientRect()
+      const containerRect = container.getBoundingClientRect()
+      return {
+        x: clientX + (webviewRect.left - containerRect.left),
+        y: clientY + (webviewRect.top - containerRect.top),
+      }
+    }
+
+    async function handleConfirmDelete() {
+      if (!deleteConfirm || deleteBusy) return
+      const operationId = `del-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+      console.log(`[delete ${operationId}] confirmation accepted`)
+      setDeleteBusy(true)
+      setDeleteError(null)
+      try {
+        const result = await onDeleteElement(deleteConfirm.target, deleteConfirm.fallbackIdentity, operationId)
+        if (!result?.success) {
+          throw new Error(result?.error || 'Element was not deleted.')
+        }
+        webviewRef.current?.send('editor:preview-candidate', null)
+        setDeleteConfirm(null)
+        setContextMenu(null)
+      } catch (err) {
+        // Anything thrown anywhere in the chain (IPC rejection, a bug in the
+        // writer, a timeout) lands here instead of leaving the dialog
+        // stuck on "Deleting…" forever with no feedback.
+        console.error('[delete-ui] deletion failed', err)
+        setDeleteError(err instanceof Error ? err.message : 'Element was not deleted.')
+      } finally {
+        setDeleteBusy(false)
+      }
+    }
 
     function updateDebug(patch: Partial<DebugSnapshot>): void {
       if (!import.meta.env.DEV) return
@@ -424,6 +480,31 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
         console.log('[preview] ipc-message', e.channel, e.args[0])
         if (e.channel === 'inspector:selected') {
           onElementSelected(e.args[0] as SelectedElement)
+          // A right-click re-selects before opening the menu, so this fires
+          // right before 'inspector:context-menu' for that same interaction
+          // — harmless, since the menu is set immediately after. Any OTHER
+          // selection (a plain click elsewhere) should close a stale menu.
+          setContextMenu(null)
+        } else if (e.channel === 'inspector:context-menu') {
+          const req = e.args[0] as ElementContextMenuRequest
+          const { x, y } = toContainerCoords(req.clientX, req.clientY)
+          setContextMenu({
+            x, y, target: req.deletionTarget, fallbackIdentity: req.fallbackIdentity,
+            candidates: req.deletionCandidates, activeCandidateId: req.activeCandidateId,
+          })
+        } else if (e.channel === 'inspector:delete-requested') {
+          const req = e.args[0] as DeleteKeyRequest
+          setContextMenu(null)
+          setDeleteError(null)
+          setDeleteConfirm({ target: req.deletionTarget, fallbackIdentity: req.fallbackIdentity })
+        } else if (e.channel === 'inspector:candidate-selected') {
+          // User picked a specific nested candidate from the submenu — skip
+          // straight to the confirm dialog for that exact node, bypassing the
+          // top-level (possibly-promoted) target entirely.
+          const req = e.args[0] as CandidateSelectedMessage
+          setContextMenu(null)
+          setDeleteError(null)
+          setDeleteConfirm({ target: req.deletionTarget, fallbackIdentity: req.fallbackIdentity })
         } else if (e.channel === 'editor:text-saved') {
           // onTextSaved is async (returns Promise<SaveStatus>).  We must catch any
           // rejection here — if we let it float, the UI stays stuck at "Saving…"
@@ -573,7 +654,56 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
     }
 
     return (
-      <div className="relative flex-1 flex flex-col bg-gray-950 overflow-hidden">
+      <div ref={containerRef} className="relative flex-1 flex flex-col bg-gray-950 overflow-hidden">
+        {contextMenu && (
+          <ElementContextMenu
+            x={contextMenu.x}
+            y={contextMenu.y}
+            target={contextMenu.target}
+            activeCandidateId={contextMenu.activeCandidateId}
+            candidates={contextMenu.candidates}
+            bounds={containerRef.current
+              ? { width: containerRef.current.clientWidth, height: containerRef.current.clientHeight }
+              : { width: 9999, height: 9999 }}
+            onDelete={() => {
+              // Deliberately do NOT clear the destructive preview outline here —
+              // it's already showing the exact default target (set the instant
+              // the menu opened) and should stay visible through the confirm
+              // step below, not disappear and reappear.
+              setDeleteError(null)
+              setDeleteConfirm({ target: contextMenu.target, fallbackIdentity: contextMenu.fallbackIdentity })
+              setContextMenu(null)
+            }}
+            onClose={() => {
+              webviewRef.current?.send('editor:preview-candidate', null)
+              setContextMenu(null)
+            }}
+            onPreviewCandidate={(candidateId) => {
+              if (webviewRef.current && isReadyRef.current) {
+                webviewRef.current.send('editor:preview-candidate', candidateId)
+              }
+            }}
+            onSelectCandidate={(candidateId) => {
+              if (webviewRef.current && isReadyRef.current) {
+                webviewRef.current.send('editor:select-candidate', candidateId)
+              }
+              setContextMenu(null)
+            }}
+          />
+        )}
+        {deleteConfirm && (
+          <DeleteConfirmDialog
+            target={deleteConfirm.target}
+            busy={deleteBusy}
+            error={deleteError}
+            onCancel={() => {
+              webviewRef.current?.send('editor:preview-candidate', null)
+              setDeleteConfirm(null)
+              setDeleteError(null)
+            }}
+            onConfirm={handleConfirmDelete}
+          />
+        )}
         {import.meta.env.DEV && debugSnapshot && (
           <div className="absolute bottom-2 right-2 z-50 w-64 rounded border border-gray-700 bg-gray-950/95 p-2 font-mono text-[10px] leading-relaxed text-gray-300 shadow-lg pointer-events-none">
             <div className="mb-1 text-gray-500">view-state debug</div>

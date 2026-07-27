@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
-type HistoryEditType = 'text' | 'image' | 'link' | 'style' | 'ast-binding' | 'manual-edit'
+type HistoryEditType = 'text' | 'image' | 'link' | 'style' | 'ast-binding' | 'manual-edit' | 'delete'
 
 interface HistoryElementMeta {
   tagName?: string
@@ -193,6 +193,23 @@ const api = {
     editType: HistoryEditType
     element?: HistoryElementMeta
   }) => ipcRenderer.invoke('editor:write-css-background-image', params),
+
+  /** Right-click / Delete-key element removal — AST-based. Records one undo/redo history entry. */
+  deleteElement: (params: {
+    directFile: string
+    directLine: number
+    directCol?: number | null
+    ownerFile?: string | null
+    ownerLine?: number | null
+    ownerCol?: number | null
+    ownerComponentName?: string | null
+    hbItemId?: string | null
+    mappedIndex?: number | null
+    projectPath: string
+    description: string
+    element?: HistoryElementMeta
+    operationId?: string
+  }) => ipcRenderer.invoke('editor:delete-element', params),
 
   /** Open a file in the system default editor (e.g. VS Code). */
   openFileInEditor: (filePath: string) => ipcRenderer.invoke('editor:open-file', filePath),

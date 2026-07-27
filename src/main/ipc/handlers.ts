@@ -18,6 +18,7 @@ import { writeImageAttrs, WriteImageAttrsParams } from '../editor/imageWriter'
 import { writeElementStyle, WriteElementStyleParams } from '../editor/elementStyleWriter'
 import { writeTailwindBgUrl, WriteTailwindBgUrlParams } from '../editor/tailwindBgWriter'
 import { writeCssBackgroundImage, WriteCssBackgroundImageParams } from '../editor/cssBackgroundWriter'
+import { deleteElement, DeleteElementParams } from '../editor/deleteElementWriter'
 import {
   getHistoryState,
   recordHistoryEntry,
@@ -147,6 +148,24 @@ export function setupIpcHandlers(
   ipcMain.handle('editor:write-css-background-image', (_e: IpcMainInvokeEvent, params: WriteCssBackgroundImageParams) =>
     writeCssBackgroundImage(params)
   )
+
+  // Right-click / Delete-key element removal — AST-based, never regex.
+  ipcMain.handle('editor:delete-element', (_e: IpcMainInvokeEvent, params: DeleteElementParams) => {
+    // deleteElement() already catches everything internally and always
+    // returns a plain serialisable result — this is a second, redundant
+    // safety net so a bug there can never leave the renderer's
+    // ipcRenderer.invoke() promise unresolved.
+    try {
+      return deleteElement(params)
+    } catch (err) {
+      console.error('[delete-element]', err)
+      return {
+        success: false,
+        code: 'DELETE_FAILED',
+        error: err instanceof Error ? err.message : 'Unknown deletion error',
+      }
+    }
+  })
 
   // ── Edit history (Undo/Redo) ────────────────────────────────────────────
   ipcMain.handle('history:get-state', (_e: IpcMainInvokeEvent, params: { projectPath: string }) =>

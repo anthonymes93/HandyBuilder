@@ -170,6 +170,24 @@ export interface HandyBuilderAPI {
     editType: HistoryEditType
     element?: HistoryElementMeta
   }) => Promise<WriteResult>
+  deleteElement: (params: {
+    directFile: string
+    directLine: number
+    directCol?: number | null
+    ownerFile?: string | null
+    ownerLine?: number | null
+    ownerCol?: number | null
+    ownerComponentName?: string | null
+    hbItemId?: string | null
+    mappedIndex?: number | null
+    projectPath: string
+    description: string
+    element?: HistoryElementMeta
+    operationId?: string
+  }) => Promise<WriteResult & {
+    code?: 'TARGET_NOT_FOUND' | 'PROTECTED' | 'AMBIGUOUS' | 'WRITE_FAILED' | 'DELETE_FAILED'
+    deletedKind?: 'jsx-element' | 'component-instance' | 'mapped-item'
+  }>
   openFileInEditor: (filePath: string) => Promise<{ success: true } | { error: string }>
   showInFolder: (filePath: string) => Promise<void>
 

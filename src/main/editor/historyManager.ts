@@ -19,7 +19,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 
-export type HistoryEditType = 'text' | 'image' | 'link' | 'style' | 'ast-binding' | 'manual-edit'
+export type HistoryEditType = 'text' | 'image' | 'link' | 'style' | 'ast-binding' | 'manual-edit' | 'delete'
 
 export interface HistoryElementMeta {
   tagName?: string

@@ -5,9 +5,22 @@ import { useTextEdit, buildElementKey } from './hooks/useTextEdit'
 import { useEditHistory } from './hooks/useEditHistory'
 import { usePreviewViewState } from './hooks/usePreviewViewState'
 import { AppLayout } from './components/Layout/AppLayout'
-import { SelectedElement, InspectorSavePatch, ImagePickResult, TextEditPayload, SourceMatch, DomPatch, HistoryElementMeta, StyleScopeChoice } from './types'
-import type { PreviewFrameHandle } from './components/Preview/PreviewPanel'
+import {
+  SelectedElement, InspectorSavePatch, ImagePickResult, TextEditPayload, SourceMatch, DomPatch,
+  HistoryElementMeta, StyleScopeChoice, DeletionTarget, ElementIdentityLike
+} from './types'
+import type { PreviewFrameHandle, PreviewViewState } from './components/Preview/PreviewPanel'
 import type { HbInjectionDiagnostic } from './components/Preview/PreviewPanel'
+
+/** Race a promise against a hard timeout so a slow/stuck dependency (a preview round-trip, an IPC call) can never hang a caller forever. */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error(message)), ms)
+    }),
+  ])
+}
 
 function elementMeta(el: SelectedElement): HistoryElementMeta {
   return { tagName: el.tagName, id: el.id, classList: el.classList }
@@ -112,6 +125,102 @@ function App() {
     await redoHistory()
     await restoreAfterSave(viewState)
   }, [captureViewState, restoreAfterSave, redoHistory, selectedElement])
+
+  // Right-click / Delete-key element removal. Same capture → write → restore
+  // shape as every other save, except the identity restored afterward is the
+  // FALLBACK element (next sibling → previous sibling → parent, computed by
+  // the bridge while the doomed element still existed) rather than the
+  // deleted element's own — there's nothing to find again.
+  const handleDeleteElement = useCallback(
+    async (target: DeletionTarget, fallbackIdentity: ElementIdentityLike | null, operationId: string): Promise<{ success: boolean; error?: string }> => {
+      const log = (msg: string) => console.log(`[delete ${operationId}] ${msg}`)
+
+      try {
+        if (!project) return { success: false, error: 'No project open.' }
+        if (!target.directFile || target.directLine == null) {
+          return { success: false, error: 'Element was not deleted.' }
+        }
+
+        // Arm the reload guard + capture scroll BEFORE writing (Vite can react
+        // to the write before our own await chain gets to it). This is
+        // best-effort: a failure here must never block the actual deletion —
+        // captureViewState() already bounds itself internally (~400ms), but
+        // withTimeout is an explicit second guard against it ever hanging.
+        log('capture view state started')
+        previewRef.current?.setExpectingReload(true, operationId)
+        let viewState: PreviewViewState | null = null
+        try {
+          const base = await withTimeout(
+            Promise.resolve(previewRef.current?.captureViewState()),
+            1500,
+            'View-state capture timed out'
+          )
+          viewState = base ? { ...base, identity: fallbackIdentity, operationId } : null
+        } catch (err) {
+          console.warn(`[delete ${operationId}] continuing without captured view state:`, err)
+        }
+        if (!viewState) previewRef.current?.setExpectingReload(false)
+        log('capture view state completed')
+
+        const description = target.ownerComponentName
+          ? `Delete ${target.ownerComponentName}`
+          : `Delete <${target.directTag ?? 'element'}>`
+
+        log('IPC request started')
+        const result = await withTimeout(
+          window.api.deleteElement({
+            directFile: target.directFile,
+            directLine: target.directLine,
+            directCol: target.directCol,
+            ownerFile: target.ownerFile,
+            ownerLine: target.ownerLine,
+            ownerCol: target.ownerCol,
+            ownerComponentName: target.ownerComponentName,
+            hbItemId: target.hbItemId,
+            mappedIndex: target.mappedIndex,
+            projectPath: project.path,
+            description,
+            operationId,
+          }),
+          10_000,
+          'Deleting the element timed out.'
+        )
+        log(`IPC response returned — success=${result.success}`)
+
+        if (!result.success) {
+          if (viewState) previewRef.current?.setExpectingReload(false)
+          return { success: false, error: result.error ?? 'Element was not deleted.' }
+        }
+
+        // Source write succeeded — this is the operation's result. Preview
+        // settling (Fast Refresh / full reload / scroll+selection restore)
+        // happens in the background and must NOT hold the dialog open.
+        refreshHistory()
+        log('source written — restoring preview in the background')
+        void (async () => {
+          try {
+            log('waiting for HMR')
+            await restoreViewState(viewState)
+            log('selection restored')
+          } catch (err) {
+            console.error(`[delete ${operationId}] background preview restore failed:`, err)
+          } finally {
+            log('operation completed')
+          }
+        })()
+
+        return { success: true }
+      } catch (err) {
+        // Absolute last resort — handleDeleteElement must NEVER throw, or the
+        // dialog's own try/catch is the only thing standing between this and
+        // an unhandled rejection that leaves "Deleting…" stuck forever.
+        console.error(`[delete ${operationId}] unexpected error:`, err)
+        cancelPendingReload()
+        return { success: false, error: err instanceof Error ? err.message : 'Element was not deleted.' }
+      }
+    },
+    [project, restoreViewState, cancelPendingReload, refreshHistory]
+  )
 
   // Keyboard shortcuts: Ctrl+Z (Undo), Ctrl+Shift+Z / Ctrl+Y (Redo).
   // Cmd on macOS. Ignored while typing in a text input/textarea/contenteditable
@@ -827,6 +936,7 @@ function App() {
       onClearSelection={handleClearSelection}
       onPageNavigated={handlePageNavigated}
       onTextSaved={handleTextSaved}
+      onDeleteElement={handleDeleteElement}
       onConfirmMatch={handleConfirmMatch}
       onCancelConfirmation={handleCancelConfirmation}
       onConfirmAstBinding={handleConfirmAstBinding}

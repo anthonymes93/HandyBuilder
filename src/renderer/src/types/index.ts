@@ -461,6 +461,90 @@ export interface StyleDiagnosticCandidate {
   hrefPreview: string | null
 }
 
+// ─── element deletion (right-click context menu) ──────────────────────────────
+
+/** Everything the bridge could determine about a right-clicked/Delete-key-targeted element, before any write happens. */
+export interface DeletionTarget {
+  directFile: string | null
+  directLine: number | null
+  directCol: number | null
+  directTag: string | null
+  /** Nearest ancestor custom component's OWN invocation site (fiber-resolved) — used to redirect deletion away from a shared component's definition file. */
+  ownerFile: string | null
+  ownerLine: number | null
+  ownerCol: number | null
+  ownerComponentName: string | null
+  hbItemId: string | null
+  mappedIndex: number | null
+  mappedSiblingCount: number | null
+  isProtected: boolean
+  protectedReason: string | null
+  displayLabel: string
+  displaySource: string
+  /** Short labels for the deleted element's DOM siblings — what visibly stays behind. */
+  remainingSiblingLabels: string[]
+  /** Short label for the deleted element's DOM parent, when it's a real containing element. */
+  remainingContainerLabel: string | null
+}
+
+/**
+ * One entry in the nested-element deletion chain built by walking the React
+ * fiber tree upward from the exact DOM node under the cursor (NOT the
+ * smart-promoted edit-selection target) — deepest first, outermost last.
+ * `deletionTarget` on the request is always one of these (the one whose
+ * `candidateId` matches `activeCandidateId`); the rest become "Delete
+ * parent ▸" options.
+ */
+export interface DeletionCandidate {
+  candidateId: string
+  /** 0 = the node the walk started from; increases going outward. */
+  depth: number
+  kind: 'intrinsic-element' | 'component-instance'
+  displayLabel: string
+  /** Already resolved/redirected exactly like a top-level deletionTarget would be — safe to delete as-is. */
+  target: DeletionTarget
+}
+
+export interface ElementContextMenuRequest {
+  clientX: number
+  clientY: number
+  selectedElement: SelectedElement
+  /** The DEFAULT deletion target — the deepest safe candidate under the cursor, not the smart-promoted edit selection. */
+  deletionTarget: DeletionTarget
+  /** Which entry in `deletionCandidates` `deletionTarget` came from; null only when no candidate could be resolved at all. */
+  activeCandidateId: string | null
+  fallbackIdentity: ElementIdentityLike | null
+  deletionCandidates: DeletionCandidate[]
+}
+
+export interface DeleteKeyRequest {
+  selectedElement: SelectedElement
+  deletionTarget: DeletionTarget
+  fallbackIdentity: ElementIdentityLike | null
+  deletionCandidates: DeletionCandidate[]
+}
+
+/** Sent by the bridge when the user picks a specific nested candidate from the submenu. */
+export interface CandidateSelectedMessage {
+  selectedElement: SelectedElement
+  deletionTarget: DeletionTarget
+  fallbackIdentity: ElementIdentityLike | null
+}
+
+/** Structurally identical to utils/elementIdentity.ts's ElementIdentity — duplicated here to avoid a renderer-utils → types import cycle; both sides of the bridge boundary just need to agree on shape. */
+export interface ElementIdentityLike {
+  hbStyleId?: string | null
+  sourceFile?: string | null
+  sourceLine?: number | null
+  sourceCol?: number | null
+  hbItemId?: string | null
+  id?: string | null
+  tagName?: string | null
+  classList?: string[]
+  textPreview?: string | null
+  href?: string | null
+}
+
 /** Returned by the image file-picker IPC call. */
 export interface ImagePickResult {
   /** URL the browser (dev server) can load, e.g. /images/photo.jpg */
@@ -492,7 +576,7 @@ export type SaveStatus =
 
 // ─── edit history (Undo/Redo) ─────────────────────────────────────────────────
 
-export type HistoryEditType = 'text' | 'image' | 'link' | 'style' | 'ast-binding' | 'manual-edit'
+export type HistoryEditType = 'text' | 'image' | 'link' | 'style' | 'ast-binding' | 'manual-edit' | 'delete'
 
 export interface HistoryElementMeta {
   tagName?: string
