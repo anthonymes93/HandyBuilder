@@ -12,6 +12,21 @@ export interface PreviewFrameHandle {
   checkHbInjection: () => Promise<HbInjectionDiagnostic>
   /** Count elements in the live preview matching a CSS selector — used to verify a style edit stayed isolated to one element. */
   countMatchingElements: (selector: string) => Promise<number>
+  /**
+   * Confirm the live preview actually renders the newly-saved background
+   * image after HMR — as opposed to the DOM-only preview patch applied
+   * before Save. Returns null when the owner element/rule can't be found
+   * (inconclusive — never used to fail a save on its own).
+   */
+  verifyBackgroundImage: (params: BackgroundVerifyParams) => Promise<boolean | null>
+}
+
+export interface BackgroundVerifyParams {
+  file: string | null
+  line: number | null
+  cssSelector: string | null
+  mode: 'img-src' | 'bg-image' | 'pseudo-before' | 'pseudo-after'
+  expectedUrlFragment: string
 }
 
 export interface HbMetadataElement {
@@ -116,6 +131,38 @@ export const PreviewPanel = forwardRef<PreviewFrameHandle, PreviewPanelProps>(
           )
         } catch {
           return -1
+        }
+      },
+      async verifyBackgroundImage(params: BackgroundVerifyParams) {
+        const webview = webviewRef.current
+        if (!webview || !isReadyRef.current) return null
+        try {
+          return await webview.executeJavaScript<boolean | null>(`(() => {
+            const params = ${JSON.stringify(params)};
+            function findByFileLine() {
+              if (!params.file || params.line == null) return null;
+              const nodes = document.querySelectorAll('[data-hb-file]');
+              for (const n of nodes) {
+                if (n.getAttribute('data-hb-file') === params.file && n.getAttribute('data-hb-line') === String(params.line)) return n;
+              }
+              return null;
+            }
+            function findBySelector() {
+              if (!params.cssSelector) return null;
+              const base = params.cssSelector.replace(/::?(before|after)\\s*$/, '').trim();
+              try { return base ? document.querySelector(base) : null; } catch { return null; }
+            }
+            const el = findByFileLine() || findBySelector();
+            if (!el) return null;
+            let value = '';
+            if (params.mode === 'img-src') value = el.currentSrc || el.src || '';
+            else if (params.mode === 'pseudo-before') value = getComputedStyle(el, '::before').backgroundImage;
+            else if (params.mode === 'pseudo-after') value = getComputedStyle(el, '::after').backgroundImage;
+            else value = getComputedStyle(el).backgroundImage;
+            return value.includes(params.expectedUrlFragment);
+          })()`)
+        } catch {
+          return null
         }
       }
     }))

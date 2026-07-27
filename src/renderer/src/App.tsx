@@ -232,12 +232,37 @@ function App() {
     return last
   }, [])
 
+  // Poll the live preview until it confirms the just-saved background-image
+  // URL actually made it into the rendered page (i.e. Vite HMR landed the
+  // file change) — or ~3s times out. `null` (owner element/rule not found)
+  // is treated as inconclusive, never as a failure.
+  const waitForBackgroundVerified = useCallback(
+    async (params: Parameters<PreviewFrameHandle['verifyBackgroundImage']>[0]): Promise<boolean | null> => {
+      const deadline = Date.now() + 3000
+      let last: boolean | null = null
+      while (Date.now() < deadline) {
+        last = (await previewRef.current?.verifyBackgroundImage(params)) ?? null
+        if (last === true) return true
+        await new Promise((resolve) => setTimeout(resolve, 200))
+      }
+      return last
+    },
+    []
+  )
+
   // ── inspector save ──────────────────────────────────────────────────────────
 
   const handleInspectorSave = useCallback(
-    async (patch: InspectorSavePatch) => {
+    async (patch: InspectorSavePatch): Promise<boolean> => {
       const el = patch.element
       const projectPath = project?.path
+
+      // A resolved pseudo-element (::before/::after) image owner has no DOM
+      // node the bridge can redirect an inline-style patch to — applying one
+      // would land (wrongly) on the selected/overlay element itself. Skip the
+      // live DOM patch entirely for that case; the preview picks up the real
+      // change once Save completes and Vite HMR re-renders the stylesheet.
+      const isPseudoOwner = patch.imageOwnerSourceType === 'pseudo-before' || patch.imageOwnerSourceType === 'pseudo-after'
 
       // Apply changes to the live preview DOM immediately.
       previewRef.current?.applyDomPatch({
@@ -245,17 +270,123 @@ function App() {
         href:               patch.href,
         linkTarget:         patch.linkTarget,
         disabled:           patch.disabled,
-        imageSrc:           patch.imageSrc,
+        imageSrc:           isPseudoOwner ? undefined : patch.imageSrc,
         imageAlt:           patch.imageAlt,
         imageWidth:         patch.imageWidth,
         imageHeight:        patch.imageHeight,
         objectFit:          patch.objectFit,
         objectPosition:     patch.objectPosition,
-        backgroundImage:    patch.backgroundImage,
+        backgroundImage:    isPseudoOwner ? undefined : patch.backgroundImage,
         backgroundSize:     patch.backgroundSize,
         backgroundPosition: patch.backgroundPosition,
         transform:          patch.transform,
       })
+
+      // ── Background-image OWNER save — resolved separately from the
+      // selected/clicked element (e.g. selected = a translucent overlay div,
+      // the real image lives on the section/img/pseudo-element behind it).
+      // Routes the write to the owner's own source location instead of the
+      // selected element's, then verifies the live preview actually picked
+      // up the change after Vite HMR before reporting Saved.
+      if (patch.imageOwnerSourceType && patch.imageOwnerFile) {
+        if (!projectPath) {
+          reportDirectWrite({ success: false, error: 'No project open — cannot save to file.' })
+          return false
+        }
+        const newUrl = (patch.imageSrc ?? '').trim()
+        if (!newUrl) {
+          reportDirectWrite({ success: false, error: 'No image URL to save.' })
+          return false
+        }
+
+        const ownerFile = patch.imageOwnerFile
+        const ownerLine = patch.imageOwnerLine ?? undefined
+        const ownerTag  = patch.imageOwnerTagName ?? undefined
+        const meta = elementMeta(el)
+        const description = 'Replaced background image'
+
+        type WriteOutcome = { success: boolean; filePath?: string; lineNumber?: number; error?: string }
+        let result: WriteOutcome
+
+        if (patch.imageOwnerSourceType === 'img-tag') {
+          if (ownerLine === undefined) {
+            reportDirectWrite({ success: false, error: 'Could not determine the source location of the image owner.' })
+            return false
+          }
+          console.log('[app] image-owner save → writeImageAttrs', { ownerFile, ownerLine, ownerTag, newUrl })
+          result = await window.api.writeImageAttrs({
+            filePath: ownerFile, lineNumber: ownerLine, tagName: ownerTag,
+            src: newUrl, projectPath, description, editType: 'image', element: meta,
+          })
+        } else if (patch.imageOwnerSourceType === 'inline-style-url') {
+          if (ownerLine === undefined) {
+            reportDirectWrite({ success: false, error: 'Could not determine the source location of the image owner.' })
+            return false
+          }
+          const styleProps: Record<string, string> = { backgroundImage: `url("${newUrl}")` }
+          if (patch.backgroundSize     !== undefined) styleProps.backgroundSize     = patch.backgroundSize
+          if (patch.backgroundPosition !== undefined) styleProps.backgroundPosition = patch.backgroundPosition
+          console.log('[app] image-owner save → writeInlineStyle', { ownerFile, ownerLine, ownerTag, styleProps })
+          result = await window.api.writeInlineStyle({
+            filePath: ownerFile, lineNumber: ownerLine, styleProps, tagName: ownerTag,
+            projectPath, description, editType: 'image', element: meta,
+          })
+        } else if (patch.imageOwnerSourceType === 'tailwind-arbitrary-url') {
+          if (ownerLine === undefined) {
+            reportDirectWrite({ success: false, error: 'Could not determine the source location of the image owner.' })
+            return false
+          }
+          console.log('[app] image-owner save → writeTailwindBgUrl', { ownerFile, ownerLine, ownerTag, newUrl })
+          result = await window.api.writeTailwindBgUrl({
+            filePath: ownerFile, lineNumber: ownerLine, colNumber: patch.imageOwnerCol ?? undefined, tagName: ownerTag,
+            newUrl, projectPath, description, editType: 'image', element: meta,
+          })
+        } else {
+          // 'css-class-url' | 'pseudo-before' | 'pseudo-after'
+          if (!patch.imageOwnerCssSelector) {
+            reportDirectWrite({
+              success: false,
+              error: 'Could not determine the CSS rule for this background image — edit it in source.',
+            })
+            return false
+          }
+          console.log('[app] image-owner save → writeCssBackgroundImage', { ownerFile, selector: patch.imageOwnerCssSelector, newUrl })
+          result = await window.api.writeCssBackgroundImage({
+            filePath: ownerFile, selectorText: patch.imageOwnerCssSelector, newUrl,
+            projectPath, description, editType: 'image', element: meta,
+          })
+        }
+
+        if (!result.success) {
+          console.log('[app] image-owner save → writer failed:', result.error)
+          reportDirectWrite({ success: false, error: result.error })
+          return false
+        }
+
+        const mode =
+          patch.imageOwnerSourceType === 'img-tag' ? 'img-src' :
+          patch.imageOwnerSourceType === 'pseudo-before' ? 'pseudo-before' :
+          patch.imageOwnerSourceType === 'pseudo-after' ? 'pseudo-after' :
+          'bg-image'
+        const verified = await waitForBackgroundVerified({
+          file: ownerFile,
+          line: ownerLine ?? null,
+          cssSelector: patch.imageOwnerCssSelector ?? null,
+          mode,
+          expectedUrlFragment: newUrl,
+        })
+        console.log('[app] image-owner save → post-save verification:', verified, '(file:', ownerFile, 'line:', ownerLine, ')')
+        if (verified === false) {
+          reportDirectWrite({
+            success: false,
+            error: `Preview updated, but ${ownerFile}${ownerLine ? `:${ownerLine}` : ''} was not confirmed to contain the new background-image source.`,
+          })
+          return false
+        }
+
+        reportDirectWrite({ success: true, filePath: result.filePath, lineNumber: result.lineNumber })
+        return true
+      }
 
       // ── Visual Button/Text style editor save ────────────────────────────────
       // Normal styles merge into style={{}} (Tailwind-safe-subset reconciled);
@@ -264,7 +395,7 @@ function App() {
       if (patch.styleNormal || patch.styleHover) {
         if (!projectPath || !el.hbSourceFile || !el.hbSourceLine) {
           reportDirectWrite({ success: false, error: 'No source location found for this element — cannot save style to file.' })
-          return
+          return false
         }
         console.log('[app] writeElementStyle →', el.hbSourceFile, 'line', el.hbSourceLine, patch.styleNormal, patch.styleHover)
         const result = await window.api.writeElementStyle({
@@ -298,7 +429,7 @@ function App() {
               identityItemId: el.hbItemId,
             },
           })
-          return
+          return false
         }
 
         if (result.hoverWarning) console.warn('[app] hover style warning:', result.hoverWarning)
@@ -312,7 +443,7 @@ function App() {
             success: false,
             error: top ? `${result.error} — top candidates: ${top}` : result.error,
           })
-          return
+          return false
         }
 
         // ── Post-save isolation check ────────────────────────────────────────
@@ -329,7 +460,7 @@ function App() {
               success: false,
               error: 'Instance style was not isolated; changes were rolled back.',
             })
-            return
+            return false
           }
           if (count === 0) {
             console.warn('[app] instance style isolation check inconclusive (no matches yet) — showing Saved')
@@ -341,7 +472,7 @@ function App() {
             ? { success: true, filePath: result.filePath, lineNumber: result.lineNumber }
             : { success: false, error: result.error }
         )
-        return
+        return result.success
       }
 
       // ── Image display-style save (new path) ────────────────────────────────
@@ -359,7 +490,7 @@ function App() {
       if (hasStyleProps && el.hbSourceFile && el.hbSourceLine) {
         if (!projectPath) {
           reportDirectWrite({ success: false, error: 'No project open — cannot save to file.' })
-          return
+          return false
         }
 
         const styleProps: Record<string, string> = {}
@@ -380,23 +511,22 @@ function App() {
             // Per-item image inside a mapped array — write to the data array item,
             // not the shared JSX style prop (which would change all mapped cards).
             const m = patch.backgroundImage.match(/url\(["']?([^"')]+)["']?\)/)
-            if (m) {
-              console.log('[app] writeArrayItemProp →', el.hbSourceFile, 'item', el.hbItemId, 'image:', m[1])
-              const result = await window.api.writeArrayItemProp({
-                filePath:    el.hbSourceFile,
-                itemId:      el.hbItemId,
-                propName:    'image',
-                propValue:   m[1],
-                projectPath,
-                description: 'Replaced background image',
-                editType:    'image',
-                element:     meta,
-              })
-              reportDirectWrite(result)
-            }
+            if (!m) return false
+            console.log('[app] writeArrayItemProp →', el.hbSourceFile, 'item', el.hbItemId, 'image:', m[1])
+            const result = await window.api.writeArrayItemProp({
+              filePath:    el.hbSourceFile,
+              itemId:      el.hbItemId,
+              propName:    'image',
+              propValue:   m[1],
+              projectPath,
+              description: 'Replaced background image',
+              editType:    'image',
+              element:     meta,
+            })
+            reportDirectWrite(result)
             // Skip writeInlineStyle — backgroundSize/backgroundPosition are sensible
             // defaults in the JSX template; writing them would affect all cards equally.
-            return
+            return result.success
           }
           if (patch.backgroundImage !== undefined) {
             const m = patch.backgroundImage.match(/url\(["']?([^"')]+)["']?\)/)
@@ -489,13 +619,13 @@ function App() {
           const failed = outcomes.find((o) => !o.success)
           if (failed) {
             reportDirectWrite({ success: false, error: failed.error ?? 'Image save failed' })
-          } else {
-            const last = outcomes[outcomes.length - 1]
-            reportDirectWrite({ success: true, filePath: last.filePath, lineNumber: last.lineNumber })
+            return false
           }
+          const last = outcomes[outcomes.length - 1]
+          reportDirectWrite({ success: true, filePath: last.filePath, lineNumber: last.lineNumber })
         }
 
-        return
+        return true
       }
 
       // ── Href save for mapped array card links ────────────────────────────────
@@ -508,7 +638,7 @@ function App() {
         if (oldHref && newHref && newHref !== oldHref) {
           if (!projectPath) {
             reportDirectWrite({ success: false, error: 'No project open — cannot save to file.' })
-            return
+            return false
           }
           console.log('[app] updateArrayItemText for href →', el.hbSourceFile, 'item', el.hbItemId)
           const result = await window.api.updateArrayItemText({
@@ -522,8 +652,9 @@ function App() {
             element: elementMeta(el),
           })
           reportDirectWrite(result)
+          return result.success
         }
-        return
+        return true
       }
 
       // ── Text / link / button / fallback saves (existing text-search path) ──
@@ -537,7 +668,7 @@ function App() {
           success: false,
           error: 'No source location found for this image — cannot save to file.',
         })
-        return
+        return false
       }
 
       type SavePair = { oldText: string; newText: string; editKind: 'text' | 'href' }
@@ -566,10 +697,11 @@ function App() {
           classList:  el.classList,
           editKind,
         })
-        if (result === 'needs-confirmation') return
+        if (result === 'needs-confirmation') return false
       }
+      return true
     },
-    [handleTextSaved, reportDirectWrite, project, waitForClassCount, undoHistory]
+    [handleTextSaved, reportDirectWrite, project, waitForClassCount, waitForBackgroundVerified, undoHistory]
   )
 
   // ── style-editor scope choice ("this button only" vs "all buttons using X") ─

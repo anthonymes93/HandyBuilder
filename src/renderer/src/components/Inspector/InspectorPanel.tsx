@@ -3,12 +3,13 @@ import { useState, useEffect, useRef } from 'react'
 import {
   SlidersHorizontal, X, ImageIcon, FolderOpen, AlertTriangle, MapPin
 } from 'lucide-react'
-import { SelectedElement, InspectorSavePatch, SaveStatus, ImagePickResult, DomPatch } from '../../types'
+import { SelectedElement, InspectorSavePatch, SaveStatus, ImagePickResult, DomPatch, ImageOwnerInfo } from '../../types'
 import { classifyElement } from '../../utils/elementKind'
 import { SaveStatusBadge } from '../Editor/SaveStatusBadge'
 import { EditField } from './ContentSection'
 import { ButtonStyleEditor } from './ButtonStyleEditor'
 import { TextStyleEditor } from './TextStyleEditor'
+import { ColourControl } from './ColourControl'
 
 // ─── shared primitives ────────────────────────────────────────────────────────
 
@@ -203,17 +204,403 @@ function FocalPointPicker({
   )
 }
 
+// ─── image owner section (resolved owner ≠ selected/clicked element) ──────────
+// Shown instead of the full drag/zoom image editor when the click resolved
+// through an overlay to a different real owner (a sibling <img>, a CSS class,
+// or a ::before/::after pseudo-element) — editing lives-drag controls for
+// fit/position on a shared class or pseudo rule would risk affecting more
+// than what's on screen, so this offers a focused URL-only editor instead.
+
+const SOURCE_TYPE_LABEL: Record<string, string> = {
+  'img-tag': 'img src attribute',
+  'inline-style-url': 'inline style',
+  'css-class-url': 'stylesheet class',
+  'tailwind-arbitrary-url': 'Tailwind arbitrary-value class',
+  'pseudo-before': '::before pseudo-element',
+  'pseudo-after': '::after pseudo-element',
+}
+
+interface ImageOwnerSectionProps {
+  element: SelectedElement
+  owner: ImageOwnerInfo
+  saveStatus: SaveStatus
+  onSave: (patch: InspectorSavePatch) => Promise<boolean>
+  onPickFile: () => Promise<ImagePickResult | null>
+  onLivePatch: (patch: DomPatch) => void
+}
+
+/**
+ * Compare URLs by path so a host-relative and host-absolute form of the same
+ * asset (e.g. "/handybuilder-assets/photo.jpg" vs
+ * "http://localhost:5176/handybuilder-assets/photo.jpg") are equal, while
+ * genuinely different images (including different remote URLs) are not.
+ */
+function normalizeImageUrl(url: string | null | undefined): string {
+  const u = (url ?? '').trim()
+  if (!u) return ''
+  try {
+    const parsed = new URL(u, 'http://__hb_normalize__')
+    if (parsed.hostname === '__hb_normalize__') return u.startsWith('/') ? u : `/${u}`
+    return parsed.pathname + parsed.search
+  } catch {
+    return u
+  }
+}
+
+function ImageOwnerSection({ element, owner, saveStatus, onSave, onPickFile, onLivePatch }: ImageOwnerSectionProps) {
+  // Identity of the resolved owner (source location + kind) — NOT including
+  // backgroundUrl. `owner.backgroundUrl` reflects the live DOM, which
+  // `livePatchUrl` below mutates directly; if the "original" value were
+  // re-derived from it on every render, the original would chase the draft
+  // the instant a live patch landed and Save would look clean immediately
+  // after picking a file. This key only changes when a genuinely different
+  // element/rule is selected.
+  const ownerKey = [
+    owner.sourceFile ?? '', owner.sourceLine ?? '', owner.sourceCol ?? '',
+    owner.sourceType ?? '', owner.cssSelector ?? '', owner.tagName,
+  ].join('|')
+
+  // `baseline` is the last known-SAVED (or freshly-selected) URL — the true
+  // "original" for dirty comparison. It only moves on a new selection or a
+  // confirmed + verified Save, never on a live-preview DOM echo.
+  const [baseline, setBaseline] = useState(() => ({ key: ownerKey, url: normalizeImageUrl(owner.backgroundUrl) }))
+  const [draftUrl, setDraftUrl] = useState(baseline.url)
+  const [picking, setPicking] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const isPseudo = owner.sourceType === 'pseudo-before' || owner.sourceType === 'pseudo-after'
+
+  // Adjust state during render (React-endorsed pattern) when the selection
+  // itself changed — a real reselect, not a live-patch echo of this owner.
+  if (ownerKey !== baseline.key) {
+    const freshUrl = normalizeImageUrl(owner.backgroundUrl)
+    setBaseline({ key: ownerKey, url: freshUrl })
+    setDraftUrl(freshUrl)
+  }
+
+  const changed = normalizeImageUrl(draftUrl) !== baseline.url
+  const canSave = changed && !!owner.sourceFile && saveStatus !== 'saving' && !saving
+
+  if (import.meta.env.DEV) {
+    const reason = saving || saveStatus === 'saving'
+      ? 'a save is in progress'
+      : !owner.sourceFile
+        ? 'no resolved image-owner source'
+        : !changed
+          ? 'no draft changes'
+          : null
+    console.log(
+      '[image-owner] dirty check — original:', baseline.url || '(empty)',
+      '| draft:', normalizeImageUrl(draftUrl) || '(empty)',
+      '| ownerType:', owner.sourceType, '| file:', owner.sourceFile, 'line:', owner.sourceLine,
+      '| changed:', changed,
+      reason ? `| Save DISABLED because: ${reason}` : '| Save ENABLED: image URL changed'
+    )
+  }
+
+  function livePatchUrl(url: string) {
+    if (isPseudo) return // no DOM node to target — preview updates after Save + HMR
+    onLivePatch(owner.sourceType === 'img-tag' ? { imageSrc: url } : { backgroundImage: url ? `url("${url}")` : 'none' })
+  }
+
+  async function handlePickFile() {
+    setPicking(true)
+    try {
+      const result = await onPickFile()
+      if (result) {
+        setDraftUrl(result.url)
+        livePatchUrl(result.url)
+      }
+    } finally {
+      setPicking(false)
+    }
+  }
+
+  async function handleSave() {
+    setSaving(true)
+    try {
+      const url = draftUrl.trim()
+      const success = await onSave({
+        element,
+        imageSrc: url,
+        imageOwnerFile: owner.sourceFile,
+        imageOwnerLine: owner.sourceLine,
+        imageOwnerCol: owner.sourceCol,
+        imageOwnerTagName: owner.tagName,
+        imageOwnerSourceType: owner.sourceType,
+        imageOwnerCssSelector: owner.cssSelector,
+      })
+      if (import.meta.env.DEV) {
+        console.log('[image-owner] save', success ? 'VERIFIED — advancing baseline, disabling Save' : 'FAILED — keeping draft dirty for retry')
+      }
+      if (success) {
+        // Source write was verified — this is now the saved state. Advance
+        // the baseline so Save disables again without needing a reselect.
+        setBaseline({ key: ownerKey, url: normalizeImageUrl(url) })
+      }
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function handleCancel() {
+    setDraftUrl(baseline.url)
+    livePatchUrl(baseline.url)
+  }
+
+  return (
+    <div className="px-3 py-2 border-b border-gray-800/60">
+      <div className="flex items-center gap-1.5 mb-2">
+        <ImageIcon className="w-3 h-3 text-green-400" />
+        <p className="text-[10px] text-gray-700 uppercase tracking-widest font-medium">Background Image</p>
+      </div>
+
+      <div className="mb-2 rounded border border-blue-900 bg-blue-950/30 p-2">
+        <p className="text-[10px] text-blue-300 leading-relaxed">
+          Selected element has no image of its own. Resolved to{' '}
+          <span className="font-mono text-blue-200">&lt;{owner.tagName}&gt;</span> via{' '}
+          <span className="font-mono text-blue-200">{owner.resolutionPath}</span>
+          {' '}({SOURCE_TYPE_LABEL[owner.sourceType ?? ''] ?? owner.sourceType}).
+        </p>
+      </div>
+
+      {!owner.sourceFile && (
+        <div className="mb-2 flex items-center gap-1.5 rounded border border-red-800 bg-red-950/40 px-2 py-1">
+          <AlertTriangle className="w-3 h-3 text-red-400 shrink-0" />
+          <span className="text-red-300 text-[10px]">Could not locate an editable source for this image.</span>
+        </div>
+      )}
+
+      <div className="mb-2">
+        <p className="text-[10px] text-gray-600 mb-1">Background URL</p>
+        <div className="flex gap-1">
+          <input
+            type="text"
+            value={draftUrl}
+            placeholder="/images/photo.jpg"
+            onChange={(e) => setDraftUrl(e.target.value)}
+            className="flex-1 min-w-0 bg-gray-800 border border-gray-700 focus:border-blue-500 focus:outline-none rounded px-2 py-1.5 text-[11px] text-gray-200 font-mono transition-colors"
+          />
+          <button
+            onClick={handlePickFile}
+            disabled={picking}
+            title="Choose image file"
+            className="px-2 py-1.5 bg-gray-800 border border-gray-700 hover:border-gray-600 hover:bg-gray-700 rounded text-gray-400 hover:text-gray-200 transition-colors disabled:opacity-40"
+          >
+            <FolderOpen className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={handleSave}
+          disabled={!canSave}
+          className="flex-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-30 disabled:cursor-not-allowed text-white text-xs rounded transition-colors"
+        >
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        <button
+          onClick={handleCancel}
+          disabled={!changed}
+          className="px-2 py-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed text-xs rounded border border-gray-800 hover:border-gray-700 transition-colors"
+        >
+          Cancel
+        </button>
+      </div>
+
+      {import.meta.env.DEV && (
+        <p className="mt-1 text-[9px] text-gray-600">
+          {canSave
+            ? 'Save enabled: image URL changed'
+            : `Save disabled because: ${
+                saving || saveStatus === 'saving' ? 'a save is in progress'
+                : !owner.sourceFile ? 'no resolved image-owner source'
+                : 'no draft changes'
+              }`}
+        </p>
+      )}
+
+      {saveStatus !== 'idle' && (
+        <div className="mt-2 flex justify-center">
+          <SaveStatusBadge status={saveStatus} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── overlay controls (the layer in front of a resolved image owner) ──────────
+// Kept entirely separate from the image editor above and routed through the
+// existing visual-style-editor save path (patch.styleNormal), which always
+// targets the SELECTED element's own source location — never the image
+// owner's — so saving an image never touches the overlay and vice versa.
+
+function OverlaySection({
+  element, saveStatus, onSave, onLivePatch,
+}: {
+  element: SelectedElement
+  saveStatus: SaveStatus
+  onSave: (patch: InspectorSavePatch) => void
+  onLivePatch: (patch: DomPatch) => void
+}) {
+  const overlay = element.overlay
+  const origOpacityPct = Math.round(parseFloat(overlay?.opacity || '1') * 100)
+
+  const [draftColor, setDraftColor] = useState(overlay?.backgroundColor ?? 'transparent')
+  const [draftOpacity, setDraftOpacity] = useState(origOpacityPct)
+
+  useEffect(() => {
+    setDraftColor(overlay?.backgroundColor ?? 'transparent')
+    setDraftOpacity(Math.round(parseFloat(overlay?.opacity || '1') * 100))
+  }, [overlay?.backgroundColor, overlay?.opacity])
+
+  if (!overlay) return null
+
+  const changed = draftColor !== overlay.backgroundColor || draftOpacity !== origOpacityPct
+
+  function patch(color: string, opacityPct: number) {
+    onLivePatch({ styleProps: { backgroundColor: color, opacity: `${opacityPct / 100}` } })
+  }
+
+  function handleSave() {
+    onSave({
+      element,
+      styleNormal: { backgroundColor: draftColor, opacity: `${draftOpacity / 100}` },
+      styleDescription: 'Changed overlay style',
+    })
+  }
+
+  function handleCancel() {
+    setDraftColor(overlay!.backgroundColor)
+    setDraftOpacity(origOpacityPct)
+    onLivePatch({ clearStyleProps: true })
+  }
+
+  return (
+    <Section title="Overlay">
+      {overlay.gradient && (
+        <p className="text-gray-600 text-[10px] mb-2 leading-relaxed">
+          Gradient overlay present — edit gradient stops in source. Colour/opacity below apply on top of it.
+        </p>
+      )}
+      <div className="space-y-2">
+        <ColourControl
+          label="Colour"
+          value={draftColor}
+          onChange={(v) => { setDraftColor(v); patch(v, draftOpacity) }}
+        />
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[10px] text-gray-600">Opacity</span>
+            <span className="text-[10px] text-gray-400 font-mono">{draftOpacity}%</span>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={draftOpacity}
+            onChange={(e) => { const v = parseInt(e.target.value, 10); setDraftOpacity(v); patch(draftColor, v) }}
+            className="w-full accent-blue-500 cursor-pointer"
+          />
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5 mt-2">
+        <button
+          onClick={handleSave}
+          disabled={!changed || saveStatus === 'saving'}
+          className="flex-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-30 disabled:cursor-not-allowed text-white text-xs rounded transition-colors"
+        >
+          Save
+        </button>
+        <button
+          onClick={handleCancel}
+          disabled={!changed}
+          className="px-2 py-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed text-xs rounded border border-gray-800 hover:border-gray-700 transition-colors"
+        >
+          Cancel
+        </button>
+      </div>
+    </Section>
+  )
+}
+
+// ─── image-resolution debug panel ──────────────────────────────────────────────
+
+function ImageOwnerDebugSection({ element }: { element: SelectedElement }) {
+  const owner = element.imageOwner
+  if (!owner) return null
+
+  return (
+    <Section title="Debug — Image Resolution">
+      <div className="space-y-1 font-mono text-[10px]">
+        <div className="flex justify-between gap-2">
+          <span className="text-gray-600 shrink-0">clicked</span>
+          <span className="text-gray-300">&lt;{element.tagName}&gt;</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-gray-600 shrink-0">image owner</span>
+          <span className="text-green-400">&lt;{owner.tagName}&gt;</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-gray-600 shrink-0">path</span>
+          <span className="text-gray-300 text-right break-all">{owner.resolutionPath}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-gray-600 shrink-0">source type</span>
+          <span className="text-blue-300 text-right">{SOURCE_TYPE_LABEL[owner.sourceType ?? ''] ?? owner.sourceType ?? 'unknown'}</span>
+        </div>
+        {owner.sourceFile && (
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-600 shrink-0">file</span>
+            <span className="text-gray-300 break-all text-right" title={owner.sourceFile}>{owner.sourceFile.split('/').pop()}</span>
+          </div>
+        )}
+        {owner.sourceLine != null && (
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-600 shrink-0">line</span>
+            <span className="text-gray-300">{owner.sourceLine}</span>
+          </div>
+        )}
+        {owner.cssSelector && (
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-600 shrink-0">selector</span>
+            <span className="text-gray-300 text-right">{owner.cssSelector}</span>
+          </div>
+        )}
+        <div className="flex justify-between gap-2 pt-0.5 border-t border-gray-800">
+          <span className="text-gray-600 shrink-0">url</span>
+          <span className="text-gray-400 break-all text-right">{owner.backgroundUrl || '(none)'}</span>
+        </div>
+      </div>
+    </Section>
+  )
+}
+
 // ─── image section ────────────────────────────────────────────────────────────
 
 interface ImageSectionProps {
   element: SelectedElement
   saveStatus: SaveStatus
-  onSave: (patch: InspectorSavePatch) => void
+  onSave: (patch: InspectorSavePatch) => Promise<boolean>
   onPickFile: () => Promise<ImagePickResult | null>
   onLivePatch: (patch: DomPatch) => void
 }
 
 function ImageSection({ element, saveStatus, onSave, onPickFile, onLivePatch }: ImageSectionProps) {
+  const owner = element.imageOwner
+  if (owner && !owner.isSelectedElement) {
+    return (
+      <ImageOwnerSection
+        element={element}
+        owner={owner}
+        saveStatus={saveStatus}
+        onSave={onSave}
+        onPickFile={onPickFile}
+        onLivePatch={onLivePatch}
+      />
+    )
+  }
+
   const isImg = element.tagName === 'img'
   const hasBg = element.computed.backgroundImage !== 'none' && element.computed.backgroundImage !== ''
 
@@ -639,7 +1026,7 @@ interface InspectorPanelProps {
   saveStatus: SaveStatus
   hbLogs: string[]
   onClearSelection: () => void
-  onInspectorSave: (patch: InspectorSavePatch) => void
+  onInspectorSave: (patch: InspectorSavePatch) => Promise<boolean>
   onPickFile: () => Promise<ImagePickResult | null>
   onLivePatch: (patch: DomPatch) => void
   onOpenFile: (filePath: string) => void
@@ -746,6 +1133,18 @@ export function InspectorPanel({
                     onPickFile={onPickFile}
                     onLivePatch={onLivePatch}
                   />
+                )}
+
+                {selectedElement.imageOwner && !selectedElement.imageOwner.isSelectedElement && (
+                  <>
+                    <OverlaySection
+                      element={selectedElement}
+                      saveStatus={saveStatus}
+                      onSave={onInspectorSave}
+                      onLivePatch={onLivePatch}
+                    />
+                    <ImageOwnerDebugSection element={selectedElement} />
+                  </>
                 )}
 
                 <Section title="Box Model">

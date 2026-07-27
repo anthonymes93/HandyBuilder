@@ -16,6 +16,8 @@ import { writeInlineStyle, WriteInlineStyleParams, writeArrayItemProp, WriteArra
 import { astLocateBinding, AstLocateParams } from '../editor/astEditor'
 import { writeImageAttrs, WriteImageAttrsParams } from '../editor/imageWriter'
 import { writeElementStyle, WriteElementStyleParams } from '../editor/elementStyleWriter'
+import { writeTailwindBgUrl, WriteTailwindBgUrlParams } from '../editor/tailwindBgWriter'
+import { writeCssBackgroundImage, WriteCssBackgroundImageParams } from '../editor/cssBackgroundWriter'
 import {
   getHistoryState,
   recordHistoryEntry,
@@ -134,6 +136,16 @@ export function setupIpcHandlers(
   // via a stable class + shared stylesheet. One atomic multi-file transaction.
   ipcMain.handle('editor:write-element-style', (_e: IpcMainInvokeEvent, params: WriteElementStyleParams) =>
     writeElementStyle(params)
+  )
+
+  // Background-image owner resolution save paths (Inspector "click through the
+  // overlay" fix) — a Tailwind bg-[url()] arbitrary-value utility…
+  ipcMain.handle('editor:write-tailwind-bg-url', (_e: IpcMainInvokeEvent, params: WriteTailwindBgUrlParams) =>
+    writeTailwindBgUrl(params)
+  )
+  // …or a background-image declaration in a plain CSS rule / ::before/::after.
+  ipcMain.handle('editor:write-css-background-image', (_e: IpcMainInvokeEvent, params: WriteCssBackgroundImageParams) =>
+    writeCssBackgroundImage(params)
   )
 
   // ── Edit history (Undo/Redo) ────────────────────────────────────────────

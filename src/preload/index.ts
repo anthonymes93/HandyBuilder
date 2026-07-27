@@ -170,6 +170,30 @@ const api = {
     scopeLine?: number
   }) => ipcRenderer.invoke('editor:write-element-style', params),
 
+  /** Replace the URL inside a `bg-[url(...)]` Tailwind arbitrary-value utility. Records one undo/redo history entry. */
+  writeTailwindBgUrl: (params: {
+    filePath: string
+    lineNumber: number
+    colNumber?: number | null
+    tagName?: string
+    newUrl: string
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
+  }) => ipcRenderer.invoke('editor:write-tailwind-bg-url', params),
+
+  /** Replace the url() of a `background-image` declaration in a plain CSS rule (base class or ::before/::after). Records one undo/redo history entry. */
+  writeCssBackgroundImage: (params: {
+    filePath: string
+    selectorText: string
+    newUrl: string
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
+  }) => ipcRenderer.invoke('editor:write-css-background-image', params),
+
   /** Open a file in the system default editor (e.g. VS Code). */
   openFileInEditor: (filePath: string) => ipcRenderer.invoke('editor:open-file', filePath),
 

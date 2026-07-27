@@ -34,6 +34,11 @@ export function classifyElement(el: SelectedElement): ElementKind {
     return 'image'
   }
 
+  // A resolved background-image owner was found at the click point, even
+  // though this exact element paints none itself (e.g. an overlay div
+  // sitting in front of the real image) — still show the Image editor.
+  if (el.imageOwner) return 'image'
+
   if (TEXT_TAGS.has(tag)) return 'text'
 
   return 'container'

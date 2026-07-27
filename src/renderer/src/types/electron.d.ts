@@ -150,6 +150,26 @@ export interface HandyBuilderAPI {
       candidates: Array<{ tagName: string; line: number; col: number; confidence: number; textPreview: string; hrefPreview: string | null }>
     }
   }>
+  writeTailwindBgUrl: (params: {
+    filePath: string
+    lineNumber: number
+    colNumber?: number | null
+    tagName?: string
+    newUrl: string
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
+  }) => Promise<WriteResult>
+  writeCssBackgroundImage: (params: {
+    filePath: string
+    selectorText: string
+    newUrl: string
+    projectPath: string
+    description: string
+    editType: HistoryEditType
+    element?: HistoryElementMeta
+  }) => Promise<WriteResult>
   openFileInEditor: (filePath: string) => Promise<{ success: true } | { error: string }>
   showInFolder: (filePath: string) => Promise<void>
 

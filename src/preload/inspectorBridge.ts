@@ -31,6 +31,14 @@ const state = {
   // to the selected element, so switching Normal ↔ Hover (or Cancel) can cleanly
   // clear properties that are no longer part of the current draft.
   lastAppliedStyleProps: new Set<string>(),
+  // The resolved visual background-image owner for the current selection, when
+  // it is a real DOM node (img-tag / inline-style-url / css-class-url /
+  // tailwind-arbitrary-url) — pseudo-element owners have no DOM node to patch.
+  // Image-related DomPatch fields target this element instead of `selected`.
+  imageOwnerEl: null as HTMLElement | null,
+  // Client coordinates of the last click — reused by collectData() when it's
+  // re-invoked without a fresh click (e.g. after an applyDomPatch echo).
+  lastClickPoint: null as { x: number; y: number } | null,
 }
 
 function setOutline(el: HTMLElement, value: string): void {
@@ -45,9 +53,210 @@ function clearHover(): void {
 
 function clearSelected(): void {
   if (state.selected) { setOutline(state.selected, ''); state.selected = null }
+  state.imageOwnerEl = null
 }
 
-function collectData(el: HTMLElement, resolvedFrom?: string | null) {
+// ─── background-image owner resolution ───────────────────────────────────────
+// A click often lands on a decorative layer (a translucent overlay div, an
+// empty absolutely-positioned content wrapper) sitting in front of the real
+// image. Rather than trust the clicked element's own computed background, we
+// scan the FULL paint z-stack at the click point (elementsFromPoint returns
+// every element whose box covers that pixel, topmost first, regardless of
+// what visually obscures it) plus the clicked element's ancestor chain, and
+// resolve the nearest candidate that actually owns an image.
+
+export type ImageOwnerSourceType =
+  | 'img-tag' | 'inline-style-url' | 'css-class-url' | 'tailwind-arbitrary-url'
+  | 'pseudo-before' | 'pseudo-after'
+
+interface ImageOwnerResult {
+  /** The real DOM node responsible — null only for pseudo-element owners. */
+  el: HTMLElement
+  pseudo: '::before' | '::after' | null
+  sourceType: ImageOwnerSourceType
+  backgroundUrl: string
+  cssSelector: string | null
+  cssSourceFile: string | null
+  resolutionPath: string
+  isSelectedElement: boolean
+}
+
+function extractUrl(bg: string): string | null {
+  const m = bg.match(/url\(["']?([^"')]+)["']?\)/)
+  return m ? m[1] : null
+}
+
+function hasUrlComponent(bg: string): boolean {
+  return /url\(/.test(bg)
+}
+
+function isPureGradient(bg: string): boolean {
+  return /-gradient\(/.test(bg) && !hasUrlComponent(bg)
+}
+
+function describeEl(el: HTMLElement): string {
+  const tag = el.tagName.toLowerCase()
+  const cls = el.classList[0] ? `.${el.classList[0]}` : ''
+  return `${tag}${cls}`
+}
+
+function findTailwindBgUrlToken(el: HTMLElement): string | null {
+  for (const c of Array.from(el.classList)) {
+    if (/^bg-\[url\(.+\)\]$/.test(c)) return c
+  }
+  return null
+}
+
+/**
+ * Find the CSSOM rule responsible for an element's (or its ::before/::after's)
+ * background-image, by matching each accessible stylesheet rule's base
+ * selector against the element. The rule's owning <style> tag's
+ * data-vite-dev-id (set by Vite's dev-time CSS injection) recovers the
+ * absolute source file path with no custom plugin required.
+ */
+function findCssBackgroundRule(
+  el: HTMLElement,
+  pseudo: '::before' | '::after' | null
+): { selectorText: string; url: string; sourceFile: string | null } | null {
+  for (const sheet of Array.from(document.styleSheets)) {
+    let rules: CSSRuleList
+    try {
+      rules = sheet.cssRules
+    } catch {
+      continue // cross-origin stylesheet — inaccessible
+    }
+    for (const rule of Array.from(rules)) {
+      if (!(rule instanceof CSSStyleRule)) continue
+      const selectorText = rule.selectorText
+      if (!selectorText) continue
+      const bg = rule.style.backgroundImage
+      if (!bg || !hasUrlComponent(bg)) continue
+
+      const selHasPseudo = /::?(before|after)\s*$/.test(selectorText)
+      if ((pseudo !== null) !== selHasPseudo) continue
+      if (pseudo) {
+        const suffix = pseudo === '::before' ? /::?before\s*$/ : /::?after\s*$/
+        if (!suffix.test(selectorText)) continue
+      }
+
+      const baseSelector = selectorText.replace(/::?(before|after)\s*$/, '').trim()
+      try {
+        if (!baseSelector || !el.matches(baseSelector)) continue
+      } catch {
+        continue // selector syntax CSSOM accepted but matches() doesn't (rare)
+      }
+
+      const ownerNode = sheet.ownerNode as (Element & { dataset?: DOMStringMap }) | null
+      const sourceFile = ownerNode?.dataset?.viteDevId ?? null
+      return { selectorText, url: extractUrl(bg) ?? '', sourceFile }
+    }
+  }
+  return null
+}
+
+function resolveImageOwner(x: number, y: number, clicked: HTMLElement): ImageOwnerResult | null {
+  const stack = (document.elementsFromPoint(x, y) as Element[]).filter(
+    (n): n is HTMLElement => n instanceof HTMLElement
+  )
+
+  const ancestors: HTMLElement[] = []
+  {
+    const BOUNDARY = new Set(['SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'BODY'])
+    let node: HTMLElement | null = clicked
+    let depth = 0
+    while (node && depth < 8) {
+      ancestors.push(node)
+      if (BOUNDARY.has(node.tagName)) break
+      node = node.parentElement
+      depth++
+    }
+  }
+
+  const seen = new Set<HTMLElement>()
+  const candidates: HTMLElement[] = []
+  for (const el of [...stack, ...ancestors]) {
+    if (seen.has(el)) continue
+    seen.add(el)
+    candidates.push(el)
+  }
+
+  for (const el of candidates) {
+    // (a) explicit <img> / <picture><img>
+    if (el.tagName === 'IMG' || el.tagName === 'PICTURE') {
+      const img = el.tagName === 'IMG' ? (el as HTMLImageElement) : el.querySelector('img')
+      if (img) {
+        return {
+          el: img,
+          pseudo: null,
+          sourceType: 'img-tag',
+          backgroundUrl: img.getAttribute('src') ?? '',
+          cssSelector: null,
+          cssSourceFile: null,
+          resolutionPath: img === clicked ? 'direct' : `${describeEl(clicked)} → ${describeEl(img)}`,
+          isSelectedElement: img === clicked,
+        }
+      }
+    }
+
+    // (b) ::before / ::after pseudo-elements
+    for (const pseudo of ['::before', '::after'] as const) {
+      const pseudoBg = window.getComputedStyle(el, pseudo).backgroundImage
+      if (pseudoBg && hasUrlComponent(pseudoBg)) {
+        const rule = findCssBackgroundRule(el, pseudo)
+        return {
+          el,
+          pseudo,
+          sourceType: pseudo === '::before' ? 'pseudo-before' : 'pseudo-after',
+          backgroundUrl: rule?.url ?? extractUrl(pseudoBg) ?? '',
+          cssSelector: rule?.selectorText ?? null,
+          cssSourceFile: rule?.sourceFile ?? null,
+          resolutionPath: `${describeEl(clicked)} → ${describeEl(el)}${pseudo}`,
+          isSelectedElement: false, // pseudo-elements are never the clicked DOM node
+        }
+      }
+    }
+
+    // (c) own computed background-image with a genuine url() component
+    //     (pure CSS gradients — e.g. Tailwind's bg-gradient-to-r overlays —
+    //     are deliberately NOT treated as an image owner here).
+    const bg = window.getComputedStyle(el).backgroundImage
+    if (bg && hasUrlComponent(bg)) {
+      const tw = findTailwindBgUrlToken(el)
+      const inlineHasUrl = hasUrlComponent(el.style.backgroundImage || '')
+      const sourceType: ImageOwnerSourceType = inlineHasUrl
+        ? 'inline-style-url'
+        : tw
+          ? 'tailwind-arbitrary-url'
+          : 'css-class-url'
+      const cssRule = sourceType === 'css-class-url' ? findCssBackgroundRule(el, null) : null
+      return {
+        el,
+        pseudo: null,
+        sourceType,
+        backgroundUrl: extractUrl(bg) ?? '',
+        cssSelector: cssRule?.selectorText ?? null,
+        cssSourceFile: cssRule?.sourceFile ?? null,
+        resolutionPath: el === clicked ? 'direct' : `${describeEl(clicked)} → ${describeEl(el)}`,
+        isSelectedElement: el === clicked,
+      }
+    }
+  }
+
+  return null
+}
+
+/** Paint info for the overlay layer (the clicked element itself) when a different owner was resolved. */
+function resolveOverlayInfo(clicked: HTMLElement, owner: ImageOwnerResult | null): { backgroundColor: string; gradient: string | null; opacity: string } | null {
+  if (!owner || owner.isSelectedElement) return null
+  const cs = window.getComputedStyle(clicked)
+  return {
+    backgroundColor: cs.backgroundColor,
+    gradient: isPureGradient(cs.backgroundImage) ? cs.backgroundImage : null,
+    opacity: cs.opacity,
+  }
+}
+
+function collectData(el: HTMLElement, resolvedFrom?: string | null, clickPoint?: { x: number; y: number }) {
   const rect = el.getBoundingClientRect()
   const cs   = window.getComputedStyle(el)
   const a    = el as HTMLAnchorElement
@@ -64,6 +273,38 @@ function collectData(el: HTMLElement, resolvedFrom?: string | null) {
     `[bridge] selected source info: file=${sourceFile ?? 'NONE'} line=${sourceLine ?? 'NONE'} ` +
     `col=${sourceCol ?? 'NONE'} tag=${sourceTag ?? 'NONE'} component=${componentName ?? 'NONE'} origin=${origin ?? 'NONE'}`
   )
+
+  // ── background-image owner resolution ───────────────────────────────────
+  const point = clickPoint ?? state.lastClickPoint ?? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+  const ownerResult = resolveImageOwner(point.x, point.y, el)
+  state.imageOwnerEl = ownerResult && !ownerResult.pseudo ? ownerResult.el : null
+
+  const usesCssFile = !!ownerResult && (!!ownerResult.pseudo || ownerResult.sourceType === 'css-class-url')
+  const jsxOwnerSource = ownerResult && !usesCssFile ? getClosestSourceInfo(ownerResult.el) : null
+
+  const imageOwnerPayload = ownerResult ? {
+    tagName: ownerResult.el.tagName.toLowerCase(),
+    sourceFile: usesCssFile ? (ownerResult.cssSourceFile ?? null) : (jsxOwnerSource?.sourceFile ?? null),
+    sourceLine: usesCssFile ? null : (jsxOwnerSource?.sourceLine ?? null),
+    sourceCol: usesCssFile ? null : (jsxOwnerSource?.sourceCol ?? null),
+    sourceTag: jsxOwnerSource?.sourceTag ?? null,
+    componentName: jsxOwnerSource?.componentName ?? null,
+    origin: jsxOwnerSource?.origin ?? null,
+    sourceType: ownerResult.sourceType,
+    backgroundUrl: ownerResult.backgroundUrl,
+    cssSelector: ownerResult.cssSelector,
+    resolutionPath: ownerResult.resolutionPath,
+    isSelectedElement: ownerResult.isSelectedElement,
+  } : null
+
+  if (ownerResult) {
+    log(
+      `[bridge] image owner resolved: <${imageOwnerPayload!.tagName}> type=${ownerResult.sourceType} ` +
+      `path="${ownerResult.resolutionPath}" file=${imageOwnerPayload!.sourceFile ?? 'NONE'} url=${ownerResult.backgroundUrl}`
+    )
+  }
+
+  const overlayPayload = resolveOverlayInfo(el, ownerResult)
 
   return {
     tagName:     el.tagName.toLowerCase(),
@@ -136,6 +377,12 @@ function collectData(el: HTMLElement, resolvedFrom?: string | null) {
     // Current route — folded into the style-identity hash so mapped/repeated
     // instances on different routes never collide.
     pathname: window.location.pathname,
+    // Resolved visual background-image owner (may differ from this element —
+    // e.g. this element is a translucent overlay in front of the real image).
+    imageOwner: imageOwnerPayload,
+    // The overlay layer's own paint info, present only when imageOwner exists
+    // and isn't this element itself.
+    overlay: overlayPayload,
   }
 }
 
@@ -228,9 +475,13 @@ function resolveSelectTarget(target: HTMLElement): Resolved {
     if (tag === 'IMG' || tag === 'PICTURE') {
       return { el: node, reason: 'image-direct', resolvedFrom: null }
     }
-    // An element with a real CSS background-image wins over any ancestor link.
+    // An element with a real url()-based CSS background-image wins over any
+    // ancestor link. A pure CSS gradient (e.g. Tailwind's bg-gradient-to-r,
+    // commonly used for decorative overlays) does NOT count here — it isn't
+    // "the image" the user is looking at, and must not hijack selection
+    // priority away from a wrapping link or a sibling/ancestor real image.
     const bg = window.getComputedStyle(node).backgroundImage
-    if (bg && bg !== 'none' && bg !== '') {
+    if (hasUrlComponent(bg)) {
       return { el: node, reason: 'background-image', resolvedFrom: null }
     }
     // Reached an anchor boundary — stop the image scan here.
@@ -283,6 +534,7 @@ function onClick(e: MouseEvent): void {
   // ── single click: select element ───────────────────────────────────────────
   lastClickMs = now
   lastClickEl = target
+  state.lastClickPoint = { x: e.clientX, y: e.clientY }
 
   const { el: resolved, reason, resolvedFrom } = resolveSelectTarget(target)
 
@@ -292,7 +544,7 @@ function onClick(e: MouseEvent): void {
   state.selected = resolved
   setOutline(resolved, SELECT_OUTLINE)
   if (state.hovered === resolved) state.hovered = null
-  ipcRenderer.sendToHost('inspector:selected', collectData(resolved, resolvedFrom))
+  ipcRenderer.sendToHost('inspector:selected', collectData(resolved, resolvedFrom, state.lastClickPoint))
 }
 
 function onMouseOver(e: MouseEvent): void {
@@ -667,25 +919,30 @@ function applyDomPatch(patch: DomPatch): void {
   }
   if (patch.disabled !== undefined) (el as HTMLButtonElement).disabled = patch.disabled
 
-  const img = el as HTMLImageElement
-  if (patch.imageSrc !== undefined) img.src = patch.imageSrc
-  if (patch.imageAlt !== undefined) img.alt = patch.imageAlt
+  // Image-related fields target the resolved background-image OWNER, which
+  // may be a different element than the selected/clicked one (e.g. selected
+  // is a translucent overlay div sitting in front of the real <img> or
+  // background-image element behind it). Falls back to `el` for the common
+  // case where the clicked element IS the owner (a plain <img> or bg-div).
+  const imgTarget = (state.imageOwnerEl ?? el) as HTMLImageElement
+  if (patch.imageSrc !== undefined) imgTarget.src = patch.imageSrc
+  if (patch.imageAlt !== undefined) imgTarget.alt = patch.imageAlt
   if (patch.imageWidth !== undefined) {
     const w = patch.imageWidth.trim()
-    if (/^\d+$/.test(w)) img.width = parseInt(w, 10)
-    else el.style.width = w
+    if (/^\d+$/.test(w)) imgTarget.width = parseInt(w, 10)
+    else imgTarget.style.width = w
   }
   if (patch.imageHeight !== undefined) {
     const h = patch.imageHeight.trim()
-    if (/^\d+$/.test(h)) img.height = parseInt(h, 10)
-    else el.style.height = h
+    if (/^\d+$/.test(h)) imgTarget.height = parseInt(h, 10)
+    else imgTarget.style.height = h
   }
-  if (patch.objectFit        !== undefined) el.style.objectFit        = patch.objectFit
-  if (patch.objectPosition   !== undefined) el.style.objectPosition   = patch.objectPosition
-  if (patch.backgroundImage  !== undefined) el.style.backgroundImage  = patch.backgroundImage
-  if (patch.backgroundSize   !== undefined) el.style.backgroundSize   = patch.backgroundSize
-  if (patch.backgroundPosition !== undefined) el.style.backgroundPosition = patch.backgroundPosition
-  if (patch.transform        !== undefined) el.style.transform        = patch.transform
+  if (patch.objectFit        !== undefined) imgTarget.style.objectFit        = patch.objectFit
+  if (patch.objectPosition   !== undefined) imgTarget.style.objectPosition   = patch.objectPosition
+  if (patch.backgroundImage  !== undefined) imgTarget.style.backgroundImage  = patch.backgroundImage
+  if (patch.backgroundSize   !== undefined) imgTarget.style.backgroundSize   = patch.backgroundSize
+  if (patch.backgroundPosition !== undefined) imgTarget.style.backgroundPosition = patch.backgroundPosition
+  if (patch.transform        !== undefined) imgTarget.style.transform        = patch.transform
 
   // Generic resolved style bag from the visual Button/Text style editors — one
   // full snapshot per change. Clear any previously-applied key that's no longer

@@ -60,7 +60,7 @@ interface AppLayoutProps {
   onCancelConfirmation: () => void
   onConfirmAstBinding: (binding: AstBinding) => void
   onCancelAstPicker: () => void
-  onInspectorSave: (patch: InspectorSavePatch) => void
+  onInspectorSave: (patch: InspectorSavePatch) => Promise<boolean>
   onPickFile: () => Promise<ImagePickResult | null>
   onLivePatch: (patch: DomPatch) => void
   onRetryLastSave: () => void

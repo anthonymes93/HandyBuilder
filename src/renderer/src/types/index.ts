@@ -177,6 +177,52 @@ export interface SelectedElement {
   hbStyleId?: string | null
   /** Current route (window.location.pathname) — part of the style-identity hash. */
   pathname?: string | null
+  /** Resolved visual background-image owner, if any candidate was found at the click point. */
+  imageOwner?: ImageOwnerInfo | null
+  /** The overlay layer's own paint info, present when imageOwner.isSelectedElement is false. */
+  overlay?: OverlayInfo | null
+}
+
+/** How the resolved background-image owner's URL is expressed in source. */
+export type ImageOwnerSourceType =
+  | 'img-tag'
+  | 'inline-style-url'
+  | 'css-class-url'
+  | 'tailwind-arbitrary-url'
+  | 'pseudo-before'
+  | 'pseudo-after'
+
+/**
+ * The element/rule that actually renders a visible background image, resolved
+ * from the clicked element by walking ancestors, the point's full stacking
+ * z-order, and pseudo-elements. May differ from the selected DOM element
+ * (e.g. selected = a translucent overlay div, owner = the section behind it).
+ */
+export interface ImageOwnerInfo {
+  tagName: string
+  sourceFile: string | null
+  sourceLine: number | null
+  sourceCol: number | null
+  sourceTag: string | null
+  componentName: string | null
+  origin: 'direct' | 'parent' | 'fiber' | null
+  sourceType: ImageOwnerSourceType | null
+  /** Current image URL as rendered (img.src, or the extracted url(...) from CSS). */
+  backgroundUrl: string | null
+  /** For css-class-url / pseudo owners — the CSS selector text of the matched rule. */
+  cssSelector?: string | null
+  /** Human-readable resolution trail, e.g. "overlay div → sibling img". */
+  resolutionPath: string
+  /** True when the owner IS the selected/clicked element (no overlay involved). */
+  isSelectedElement: boolean
+}
+
+/** The translucent/coloured layer sitting in front of a resolved image owner. */
+export interface OverlayInfo {
+  backgroundColor: string
+  /** Raw CSS gradient value when the overlay's backgroundImage is a gradient (no url()). */
+  gradient: string | null
+  opacity: string
 }
 
 /** Typed interface for Electron's <webview> element used in PreviewPanel. */
@@ -361,6 +407,16 @@ export interface InspectorSavePatch {
   backgroundSize?: string
   backgroundPosition?: string
   transform?: string
+  // Present only when the background image being saved belongs to a resolved
+  // owner other than the selected element (e.g. clicked an overlay div, the
+  // real image is the section behind it) — routes the write to the owner's
+  // own source location instead of the selected element's.
+  imageOwnerFile?: string | null
+  imageOwnerLine?: number | null
+  imageOwnerCol?: number | null
+  imageOwnerTagName?: string | null
+  imageOwnerSourceType?: ImageOwnerSourceType | null
+  imageOwnerCssSelector?: string | null
   // Button/Text visual style editor — present only when saving from those editors.
   styleNormal?: Partial<StyleProps>
   styleHover?: Partial<StyleProps>
